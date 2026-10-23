@@ -61,6 +61,12 @@ from .relay import (
     EacpRelay,
     RelayClientSession,
 )
+from .budget import (
+    BudgetError,
+    PayloadTokenMeter,
+    TokenBudgetLedger,
+    TokenMeter,
+)
 from .client import (
     RSessionBase,
 )
@@ -130,6 +136,11 @@ __all__ = [
     "DeadlockGraph",
     "EacpRelay",
     "RelayClientSession",
+    # Token Budget
+    "BudgetError",
+    "PayloadTokenMeter",
+    "TokenBudgetLedger",
+    "TokenMeter",
     # Client
     "RSessionBase",
     # Enterprise Telemetry

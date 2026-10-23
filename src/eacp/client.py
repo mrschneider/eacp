@@ -27,6 +27,12 @@ from .frame import CryptoEnvelope, EacpFrame, ExecutionConstraints, HEADER_STRUC
 from .primitives import EacpRendezvousException
 from .security import AgentIdentity, PlatSecGate, SecurityManifest, SignedManifest, format_pin
 from .telemetry import TraceContext
+from .budget import (
+    BudgetError,
+    PayloadTokenMeter,
+    TokenBudgetLedger,
+    TokenMeter,
+)
 
 logger = logging.getLogger("eacp.client")
 
@@ -47,6 +53,8 @@ class RSessionBase:
         signed_manifest: Optional[SignedManifest] = None,
         heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
         max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE,
+        token_meter: Optional[TokenMeter] = None,
+        token_ledger_capacity: int = 1_000_000,
     ):
         self.identity: AgentIdentity = identity or AgentIdentity.generate()
         self.signed_manifest = signed_manifest
@@ -62,6 +70,8 @@ class RSessionBase:
         self.gate: PlatSecGate = PlatSecGate(self.manifest, strict_mode=strict_mode)
         self.heartbeat_interval_s = heartbeat_interval_s
         self.max_payload_size = max_payload_size
+        self.token_meter: TokenMeter = token_meter or PayloadTokenMeter()
+        self.ledger: TokenBudgetLedger = TokenBudgetLedger(ledger_capacity=token_ledger_capacity)
         
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -244,12 +254,21 @@ class RSessionBase:
         request_frame: EacpFrame,
         status: int | EacpError = EacpError.EACP_SUCCESS,
         result_data: Any = None,
+        remaining_budget: Optional[int] = None,
     ) -> None:
         """Sends MsgReply completing rendezvous transaction."""
         if not self._connected or not self.writer:
             raise ConnectionError("RSessionBase is not connected")
 
         reply_frame = request_frame.create_reply(status=int(status), result_data=result_data)
+        if remaining_budget is not None:
+            # Slot 2 on the reply carries the budget REMAINING after settlement,
+            # letting the caller cascade the unused envelope downstream.
+            reply_frame.constraints = ExecutionConstraints(
+                token_budget=remaining_budget,
+                timeout_ms=request_frame.constraints.timeout_ms if request_frame.constraints else 5000,
+                max_depth_hops=request_frame.constraints.max_depth_hops if request_frame.constraints else 10,
+            )
         self.identity.sign_frame(reply_frame)
         self.writer.write(reply_frame.pack())
         await self.writer.drain()
@@ -352,11 +371,22 @@ class RSessionBase:
         frame: EacpFrame,
         token_budget: Optional[int] = None,
         timeout_ms: Optional[int] = None,
+        tokens_used: int = 0,
     ) -> ExecutionConstraints:
         """
-        Creates child execution constraints with decremented max_depth_hops
-        to prevent infinite agentic delegation cycles.
+        Creates child execution constraints with decremented max_depth_hops.
+        When `tokens_used` is given, the child budget is the parent's
+        remaining envelope after the parent's own consumption (cascade
+        accounting): parent_budget - tokens_used.
         """
+        from .budget import create_downstream_constraints as cascade_constraints
+
+        if tokens_used:
+            child = cascade_constraints(frame, tokens_used, timeout_ms=timeout_ms)
+            if token_budget is not None:
+                child.token_budget = min(child.token_budget, token_budget) if child.token_budget else token_budget
+            return child
+
         parent_hops = frame.constraints.max_depth_hops if frame.constraints else 10
         budget = token_budget if token_budget is not None else (frame.constraints.token_budget if frame.constraints else 0)
         timeout = timeout_ms if timeout_ms is not None else (frame.constraints.timeout_ms if frame.constraints else 5000)
@@ -366,8 +396,16 @@ class RSessionBase:
             max_depth_hops=max(0, parent_hops - 1),
         )
 
+    def spend_tokens(self, txn_id: int, tokens: int) -> int:
+        """
+        Incremental metering hook for handlers: spends `tokens` mid-transaction
+        against the active escrow. Raises BudgetError on overflow (the handler
+        should stop work immediately; the dispatcher settles/refunds on return).
+        """
+        return self.ledger.consume(txn_id, tokens)
+
     async def _dispatch_handler(self, frame: EacpFrame) -> None:
-        """Invokes handler with PlatSec capability enforcement and hop limit check."""
+        """Invokes handler with PlatSec enforcement, hop limit and token budget escrow."""
         handler = self._action_handlers.get(frame.verb)
         if not handler:
             await self.reply(frame, status=EacpError.EACP_ERR_MALFORMED_FRAME)
@@ -388,12 +426,47 @@ class RSessionBase:
             await self.reply(frame, status=err_code, result_data={"error": "PlatSec capability denied"})
             return
 
+        # --- Token budget lifecycle (kernel escrow discipline) -------------
+        # Escrow happens BEFORE any work: an over-budget request is refused
+        # without spending a single unit of compute (fail-closed).
+        budget = frame.constraints.token_budget if frame.constraints else 0
+        try:
+            self.ledger.escrow(frame.transaction_id, budget)
+        except BudgetError as esc_err:
+            await self.reply(
+                frame,
+                status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                result_data={"error": "budget escrow refused", "detail": esc_err.detail},
+            )
+            return
+
         try:
             res = handler(frame)
             if inspect.iscoroutine(res):
                 res = await res
-            await self.reply(frame, status=EacpError.EACP_SUCCESS, result_data=res)
+            usage = int(self.token_meter.measure(frame, res))
+            try:
+                self.ledger.consume(frame.transaction_id, usage)
+                remaining = self.ledger.commit(frame.transaction_id)
+            except BudgetError as over_err:
+                self.ledger.refund(frame.transaction_id)
+                await self.reply(
+                    frame,
+                    status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                    result_data={"error": "token budget overflow", "detail": over_err.detail},
+                )
+                return
+            await self.reply(frame, status=EacpError.EACP_SUCCESS, result_data=res, remaining_budget=remaining)
+        except BudgetError as bud_err:
+            # Handler itself hit the envelope (e.g. via spend_tokens): refund + overflow reply
+            self.ledger.refund(frame.transaction_id)
+            await self.reply(
+                frame,
+                status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                result_data={"error": "token budget overflow", "detail": bud_err.detail},
+            )
         except Exception as exc:
+            self.ledger.refund(frame.transaction_id)
             logger.error(f"Error executing action {frame.verb}: {exc}", exc_info=True)
             await self.reply(frame, status=EacpError.EACP_ERR_CANCELLED, result_data={"error": str(exc)})
 

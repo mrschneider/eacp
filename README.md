@@ -31,6 +31,7 @@
 | Wire Compression | `frame.py` | Transparent zlib compression of payloads > 1 KB (`FLAG_COMPRESSED`) |
 | Keepalive | `relay.py` | `PULSE_HEARTBEAT` presence + dead-route reaper (3x missed → prune) |
 | Hop Guard | `client.py` | `max_depth_hops` decremental enforcement prevents infinite agent delegation |
+| Token Budget Escrow | `budget.py` | Kernel-style escrow/settle/refund ledger with pluggable `TokenMeter`, ledger capacity and `EACP_ERR_TOKEN_OVERFLOW` |
 | Fail-Closed PlatSec | `security.py` | `strict_mode=True` rejects any action not registered in the manifest |
 
 ---
