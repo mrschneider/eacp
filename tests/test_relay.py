@@ -3,6 +3,7 @@ End-to-end multi-agent IPC rendezvous tests for EACP Relay, PlatSec, and Deadloc
 """
 
 import asyncio
+import sys
 import unittest
 
 from eacp.constants import Capability, EacpError, PulseCode
@@ -184,6 +185,7 @@ class TestEacpRendezvousEndToEnd(unittest.IsolatedAsyncioTestCase):
         await client.close()
         await server.close()
 
+    @unittest.skipIf(sys.platform == "win32", "Unix domain sockets are not available on Windows")
     async def test_unix_domain_socket_rendezvous(self):
         uds_path = "/tmp/test_eacp_uds.sock"
         uds_relay = EacpRelay()

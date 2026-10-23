@@ -177,7 +177,11 @@ class TestAsyncActiveScheduler(unittest.IsolatedAsyncioTestCase):
         obj.start_async(async_worker())
         self.assertTrue(obj.is_active())
 
-        await asyncio.sleep(0.03)
+        # Wait deterministically for async completion (no fixed-sleep races)
+        for _ in range(200):
+            if obj.status.is_complete():
+                break
+            await asyncio.sleep(0.01)
         await scheduler.run_until_idle()
 
         self.assertEqual(active_dispatched, ["async_result_42"])
