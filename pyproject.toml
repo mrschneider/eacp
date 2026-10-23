@@ -7,10 +7,36 @@ name = "eacp"
 version = "1.0.0"
 description = "Enterprise Agentic Communication Protocol (EACP) Reference Implementation"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [{ name = "Guilherme Schneider", email = "guilherme.barcha@gmail.com" }]
+keywords = ["agents", "ipc", "microkernel", "multi-agent", "rendezvous", "security", "protocol"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Security :: Cryptography",
+]
 dependencies = [
     "cryptography>=41.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mrschneider/eacp"
+Repository = "https://github.com/mrschneider/eacp"
+Changelog = "https://github.com/mrschneider/eacp/blob/master/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/mrschneider/eacp/issues"
+
+[project.optional-dependencies]
+dev = ["build", "twine"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

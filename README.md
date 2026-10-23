@@ -1,5 +1,10 @@
 # EACP: Enterprise Agentic Communication Protocol
 
+[![CI](https://github.com/mrschneider/eacp/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/eacp/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Code Style](https://img.shields.io/badge/wire%20format-48%20byte%20binary-orange)
+
 **EACP** is a microkernel-grade communication and coordination protocol for enterprise multi-agent systems. It fuses the concurrency and security architectures of **Symbian OS (EKA2)** with the synchronous rendezvous and push-relay architecture of **BlackBerry OS / QNX Neutrino**.
 
 ---
