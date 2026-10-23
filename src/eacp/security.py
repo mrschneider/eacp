@@ -148,18 +148,24 @@ class PlatSecGate:
     If (Granted & Required) != Required => EACP_ERR_CAPABILITY_DENIED
     """
 
-    def __init__(self, manifest: SecurityManifest):
+    def __init__(self, manifest: SecurityManifest, strict_mode: bool = False):
         self.manifest = manifest
+        self.strict_mode = strict_mode
         self._tool_registry: Dict[str, Capability] = {}
 
     def register_tool(self, action: str, required_caps: Capability) -> None:
         self._tool_registry[action] = required_caps
 
-    def get_tool_requirements(self, action: str) -> Capability:
-        return self._tool_registry.get(action, Capability.NONE)
+    def get_tool_requirements(self, action: str) -> Optional[Capability]:
+        return self._tool_registry.get(action)
 
     def evaluate(self, frame_capabilities: int, action: str) -> Tuple[bool, int]:
         required = self.get_tool_requirements(action)
+        if required is None:
+            if self.strict_mode:
+                return False, EacpError.EACP_ERR_CAPABILITY_DENIED
+            return True, EacpError.EACP_SUCCESS
+
         if required == Capability.NONE:
             return True, EacpError.EACP_SUCCESS
 

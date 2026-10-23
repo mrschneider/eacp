@@ -131,6 +131,22 @@ class TestEacpSecurity(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(err, EacpError.EACP_ERR_CAPABILITY_DENIED)
 
+    def test_platsec_strict_mode(self):
+        manifest = SecurityManifest(
+            pin=0x1234,
+            allowed_capabilities=Capability.CAP_DISK_READ,
+        )
+        # Non-strict allows unregistered tools if they demand no special caps
+        lenient_gate = PlatSecGate(manifest, strict_mode=False)
+        allowed, err = lenient_gate.evaluate(int(Capability.CAP_DISK_READ), "unregistered_action")
+        self.assertTrue(allowed)
+
+        # Strict gate fails closed for any unregistered tool
+        strict_gate = PlatSecGate(manifest, strict_mode=True)
+        allowed, err = strict_gate.evaluate(int(Capability.CAP_DISK_READ), "unregistered_action")
+        self.assertFalse(allowed)
+        self.assertEqual(err, EacpError.EACP_ERR_CAPABILITY_DENIED)
+
 
 if __name__ == "__main__":
     unittest.main()

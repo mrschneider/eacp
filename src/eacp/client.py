@@ -39,6 +39,7 @@ class RSessionBase:
         self,
         identity: Optional[AgentIdentity] = None,
         allowed_capabilities: Capability = Capability.NONE,
+        strict_mode: bool = False,
     ):
         self.identity: AgentIdentity = identity or AgentIdentity.generate()
         self.manifest: SecurityManifest = SecurityManifest(
@@ -46,7 +47,7 @@ class RSessionBase:
             allowed_capabilities=allowed_capabilities,
             public_bytes=self.identity.public_bytes,
         )
-        self.gate: PlatSecGate = PlatSecGate(self.manifest)
+        self.gate: PlatSecGate = PlatSecGate(self.manifest, strict_mode=strict_mode)
         
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -83,9 +84,17 @@ class RSessionBase:
     def register_pulse_callback(self, code: int | PulseCode, callback: Callable[[int, int], Any]) -> None:
         self._pulse_callbacks[int(code)] = callback
 
-    async def connect(self, host: str = "127.0.0.1", port: int = 8990) -> None:
-        """Connects to EACP Relay and performs registration."""
-        self.reader, self.writer = await asyncio.open_connection(host, port)
+    async def connect(
+        self,
+        host: Optional[str] = "127.0.0.1",
+        port: Optional[int] = 8990,
+        unix_path: Optional[str] = None,
+    ) -> None:
+        """Connects to EACP Relay via TCP or Unix Domain Socket and performs registration."""
+        if unix_path:
+            self.reader, self.writer = await asyncio.open_unix_connection(unix_path)
+        else:
+            self.reader, self.writer = await asyncio.open_connection(host or "127.0.0.1", port or 8990)
         self._connected = True
         self._pump_task = asyncio.create_task(self._frame_pump())
 
@@ -121,6 +130,19 @@ class RSessionBase:
             timeout_sec = timeout_ms / 1000.0 if timeout_ms > 0 else None
             return await asyncio.wait_for(fut, timeout=timeout_sec)
         except asyncio.TimeoutError:
+            # Inform relay via PULSE_CANCEL to unblock deadlock dependency immediately
+            try:
+                cancel_pulse = EacpFrame.create_pulse(
+                    sender_pin=self.identity.pin,
+                    target_pin=frame.target_pin,
+                    pulse_code=PulseCode.PULSE_CANCEL,
+                    tx_id=frame.transaction_id,
+                )
+                self.writer.write(cancel_pulse.pack())
+                await self.writer.drain()
+            except Exception:
+                pass
+
             raise EacpRendezvousException(
                 EacpError.EACP_ERR_TIMEOUT,
                 f"Rendezvous timeout ({timeout_ms}ms) awaiting reply for tx {frame.transaction_id}",
@@ -269,11 +291,39 @@ class RSessionBase:
                     fut.set_exception(ConnectionError("Connection closed"))
             self._pending_replies.clear()
 
+    @staticmethod
+    def create_downstream_constraints(
+        frame: EacpFrame,
+        token_budget: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> ExecutionConstraints:
+        """
+        Creates child execution constraints with decremented max_depth_hops
+        to prevent infinite agentic delegation cycles.
+        """
+        parent_hops = frame.constraints.max_depth_hops if frame.constraints else 10
+        budget = token_budget if token_budget is not None else (frame.constraints.token_budget if frame.constraints else 0)
+        timeout = timeout_ms if timeout_ms is not None else (frame.constraints.timeout_ms if frame.constraints else 5000)
+        return ExecutionConstraints(
+            token_budget=budget,
+            timeout_ms=timeout,
+            max_depth_hops=max(0, parent_hops - 1),
+        )
+
     async def _dispatch_handler(self, frame: EacpFrame) -> None:
-        """Invokes handler with PlatSec capability enforcement."""
+        """Invokes handler with PlatSec capability enforcement and hop limit check."""
         handler = self._action_handlers.get(frame.verb)
         if not handler:
             await self.reply(frame, status=EacpError.EACP_ERR_MALFORMED_FRAME)
+            return
+
+        # Execution constraints check (max_depth_hops)
+        if frame.constraints and frame.constraints.max_depth_hops <= 0:
+            await self.reply(
+                frame,
+                status=EacpError.EACP_ERR_DEPTH_EXCEEDED,
+                result_data={"error": "EACP execution depth exceeded (max_depth_hops reached 0)"},
+            )
             return
 
         # PlatSec capability check

@@ -2,11 +2,14 @@
 Unit tests for Symbian ActiveScheduler, CActive objects, and CleanupStack.
 """
 
+import asyncio
 import unittest
 
 from eacp.constants import ActivePriority, RequestStatus
 from eacp.scheduler import (
     ActiveScheduler,
+    AsyncActive,
+    AsyncActiveScheduler,
     CActive,
     CleanupItem,
     CleanupStack,
@@ -153,6 +156,32 @@ class TestEacpScheduler(unittest.TestCase):
 
         self.assertTrue(res.cleaned)
         self.assertEqual(len(scheduler.cleanup_stack), 0)
+
+
+class TestAsyncActiveScheduler(unittest.IsolatedAsyncioTestCase):
+    async def test_async_active_bridge_execution(self):
+        scheduler = AsyncActiveScheduler()
+        active_dispatched = []
+
+        class ComputeActive(AsyncActive):
+            def run_l(self):
+                active_dispatched.append(self.result)
+
+        obj = ComputeActive(priority=ActivePriority.EPriorityHigh)
+        scheduler.add(obj)
+
+        async def async_worker():
+            await asyncio.sleep(0.01)
+            return "async_result_42"
+
+        obj.start_async(async_worker())
+        self.assertTrue(obj.is_active())
+
+        await asyncio.sleep(0.03)
+        await scheduler.run_until_idle()
+
+        self.assertEqual(active_dispatched, ["async_result_42"])
+        self.assertFalse(obj.is_active())
 
 
 if __name__ == "__main__":

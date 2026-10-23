@@ -5,10 +5,12 @@ offline push buffering, and cycle deadlock detection.
 
 from __future__ import annotations
 import asyncio
+import os
+import time
 from collections import deque
 import logging
 import struct
-from typing import Dict, Optional, Set, Tuple
+from typing import Deque, Dict, Optional, Set, Tuple
 
 from .constants import (
     EACP_MAGIC,
@@ -123,8 +125,9 @@ class EacpRelay:
         self.routes: Dict[int, RelayClientSession] = {}
         self.verifiers: Dict[int, AgentVerifier] = {}
         self.deadlock_graph: DeadlockGraph = DeadlockGraph()
-        self.push_queues: Dict[int, deque[EacpFrame]] = {}
+        self.push_queues: Dict[int, Deque[Tuple[float, EacpFrame]]] = {}
         self.server: Optional[asyncio.Server] = None
+        self.unix_path: Optional[str] = None
         self._running: bool = False
 
     def register_agent(
@@ -138,11 +141,23 @@ class EacpRelay:
             self.verifiers[pin] = verifier
             session.verifier = verifier
 
-        # Drain queued offline push messages for this agent
+        # Drain queued offline push messages for this agent respecting TTL
         if pin in self.push_queues and self.push_queues[pin]:
             queue = self.push_queues[pin]
+            now = time.monotonic()
             while queue:
-                msg = queue.popleft()
+                enqueued_at, msg = queue.popleft()
+                timeout_sec = (msg.constraints.timeout_ms / 1000.0) if (msg.constraints and msg.constraints.timeout_ms > 0) else 5.0
+                if (now - enqueued_at) > timeout_sec:
+                    # Message expired while offline in queue
+                    if msg.msg_type == MsgType.MSG_SEND:
+                        self.deadlock_graph.remove_dependency(msg.sender_pin)
+                        sender_sess = self.routes.get(msg.sender_pin)
+                        if sender_sess and not sender_sess.closed:
+                            err_reply = msg.create_reply(status=EacpError.EACP_ERR_TIMEOUT)
+                            asyncio.create_task(sender_sess.send_frame(err_reply))
+                    continue
+
                 asyncio.create_task(session.send_frame(msg))
 
     def unregister_agent(self, pin: int) -> None:
@@ -255,12 +270,19 @@ class EacpRelay:
             # Reply releases the dependency (target_pin was waiting for sender_pin's reply)
             self.deadlock_graph.remove_dependency(target_pin)
 
+        elif frame.msg_type == MsgType.MSG_PULSE:
+            code, _ = frame.get_pulse_data()
+            if code == PulseCode.PULSE_CANCEL:
+                # Cancel frees sender's in-flight dependency
+                self.deadlock_graph.remove_dependency(sender_pin)
+
         # 3. Route to target
         target_session = self.routes.get(target_pin)
         if target_session and not target_session.closed:
             await target_session.send_frame(frame)
         else:
             # Target is offline
+            now = time.monotonic()
             if frame.msg_type == MsgType.MSG_SEND:
                 # If urgent or no buffering allowed, return unknown PIN immediately
                 if frame.flags & FrameFlags.FLAG_URGENT:
@@ -272,7 +294,7 @@ class EacpRelay:
                     # Buffer message in push queue
                     if target_pin not in self.push_queues:
                         self.push_queues[target_pin] = deque(maxlen=self.max_push_queue)
-                    self.push_queues[target_pin].append(frame)
+                    self.push_queues[target_pin].append((now, frame))
             elif frame.msg_type in (MsgType.MSG_PULSE, MsgType.MSG_REPLY):
                 # For replies where target is lost, clear deadlock edge
                 if frame.msg_type == MsgType.MSG_REPLY:
@@ -280,18 +302,35 @@ class EacpRelay:
                 # Store pulse or drop
                 if target_pin not in self.push_queues:
                     self.push_queues[target_pin] = deque(maxlen=self.max_push_queue)
-                self.push_queues[target_pin].append(frame)
+                self.push_queues[target_pin].append((now, frame))
 
-    async def start(self, host: str = "127.0.0.1", port: int = 8990) -> None:
+    async def start(
+        self,
+        host: Optional[str] = "127.0.0.1",
+        port: Optional[int] = 8990,
+        unix_path: Optional[str] = None,
+    ) -> None:
         self._running = True
-        self.server = await asyncio.start_server(self.handle_connection, host, port)
-        logger.info(f"EACP Relay started on {host}:{port}")
+        self.unix_path = unix_path
+        if unix_path:
+            if os.path.exists(unix_path):
+                os.unlink(unix_path)
+            self.server = await asyncio.start_unix_server(self.handle_connection, path=unix_path)
+            logger.info(f"EACP Relay started on unix socket {unix_path}")
+        elif host is not None and port is not None:
+            self.server = await asyncio.start_server(self.handle_connection, host, port)
+            logger.info(f"EACP Relay started on {host}:{port}")
 
     async def stop(self) -> None:
         self._running = False
         if self.server:
             self.server.close()
             await self.server.wait_closed()
+        if self.unix_path and os.path.exists(self.unix_path):
+            try:
+                os.unlink(self.unix_path)
+            except Exception:
+                pass
         for session in list(self.routes.values()):
             session.close()
         self.routes.clear()

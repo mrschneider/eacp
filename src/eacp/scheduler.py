@@ -3,9 +3,10 @@ EACP Concurrency Subsystem: Symbian EKA2 ActiveScheduler, CActive objects, and C
 """
 
 from __future__ import annotations
+import asyncio
 import inspect
 from contextlib import contextmanager
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Coroutine, List, Optional
 
 from .constants import ActivePriority, RequestStatus
 
@@ -216,3 +217,62 @@ class ActiveScheduler:
 
     def stop(self) -> None:
         self._running = False
+
+
+class AsyncActive(CActive):
+    """
+    Bridge connecting an asyncio coroutine/Task to Symbian CActive Active Object.
+    When the async operation completes, triggers RunL() with deterministic CleanupStack rollback.
+    """
+
+    def __init__(self, priority: ActivePriority = ActivePriority.EPriorityStandard):
+        super().__init__(priority=priority)
+        self._async_task: Optional[asyncio.Task[Any]] = None
+        self._result: Any = None
+        self._error: Optional[BaseException] = None
+
+    @property
+    def result(self) -> Any:
+        if self._error:
+            raise self._error
+        return self._result
+
+    def start_async(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Schedules coroutine and marks this Active Object as pending."""
+        self.set_active()
+        loop = asyncio.get_running_loop()
+        self._async_task = loop.create_task(coro)
+        self._async_task.add_done_callback(self._on_async_done)
+
+    def _on_async_done(self, task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            self.status.complete(RequestStatus.KErrCancel)
+        elif task.exception():
+            self._error = task.exception()
+            self.status.complete(RequestStatus.KErrGeneral)
+        else:
+            self._result = task.result()
+            self.status.complete(RequestStatus.KErrNone)
+
+        if self.scheduler:
+            self.scheduler.run_one_cycle()
+
+    def do_cancel(self) -> None:
+        if self._async_task and not self._async_task.done():
+            self._async_task.cancel()
+
+
+class AsyncActiveScheduler(ActiveScheduler):
+    """
+    Asynchronous Symbian ActiveScheduler running natively within an asyncio event loop.
+    Dispatches highest-priority ready CActive objects non-preemptively.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._wakeup_event: Optional[asyncio.Event] = None
+
+    async def run_until_idle(self) -> None:
+        """Drains all currently completed Active Objects."""
+        while self.run_one_cycle():
+            await asyncio.sleep(0)

@@ -32,6 +32,8 @@ from .security import (
 )
 from .scheduler import (
     ActiveScheduler,
+    AsyncActive,
+    AsyncActiveScheduler,
     CActive,
     CleanupItem,
     CleanupStack,
@@ -80,6 +82,8 @@ __all__ = [
     "format_pin",
     # Scheduler
     "ActiveScheduler",
+    "AsyncActive",
+    "AsyncActiveScheduler",
     "CActive",
     "CleanupItem",
     "CleanupStack",

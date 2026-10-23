@@ -72,6 +72,7 @@ class EacpError(IntEnum):
     EACP_ERR_SIGNATURE_INVALID = 8
     EACP_ERR_MALFORMED_FRAME = 9
     EACP_ERR_DISCONNECTED = 10
+    EACP_ERR_DEPTH_EXCEEDED = 11
 
 
 class RequestStatus(IntEnum):

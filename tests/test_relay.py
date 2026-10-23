@@ -184,6 +184,82 @@ class TestEacpRendezvousEndToEnd(unittest.IsolatedAsyncioTestCase):
         await client.close()
         await server.close()
 
+    async def test_unix_domain_socket_rendezvous(self):
+        uds_path = "/tmp/test_eacp_uds.sock"
+        uds_relay = EacpRelay()
+        await uds_relay.start(unix_path=uds_path)
+
+        server = RSessionBase(allowed_capabilities=Capability.CAP_DISK_READ)
+        client = RSessionBase(allowed_capabilities=Capability.CAP_DISK_READ)
+
+        server.register_handler("uds_ping", lambda f: {"pong": True}, required_caps=Capability.CAP_DISK_READ)
+
+        await server.connect(unix_path=uds_path)
+        await client.connect(unix_path=uds_path)
+
+        reply = await MsgSend(client, target_pin=server.pin, verb="uds_ping")
+        self.assertEqual(reply.data, {"pong": True})
+
+        await client.close()
+        await server.close()
+        await uds_relay.stop()
+
+    async def test_max_depth_hops_exceeded(self):
+        server = RSessionBase()
+        client = RSessionBase()
+
+        server.register_handler("step", lambda f: "ok")
+
+        await server.connect(host="127.0.0.1", port=self.port)
+        await client.connect(host="127.0.0.1", port=self.port)
+
+        # Send with max_depth_hops=0 (budget exhausted)
+        with self.assertRaises(EacpRendezvousException) as ctx:
+            await MsgSend(
+                client,
+                target_pin=server.pin,
+                verb="step",
+                constraints=ExecutionConstraints(max_depth_hops=0),
+            )
+        self.assertEqual(ctx.exception.code, EacpError.EACP_ERR_DEPTH_EXCEEDED)
+
+        await client.close()
+        await server.close()
+
+    async def test_deadlock_cleanup_on_timeout(self):
+        # Verify that when client times out, PULSE_CANCEL frees deadlock graph edge
+        agent_a = RSessionBase()
+        agent_b = RSessionBase()
+
+        # Agent B handler takes 500ms
+        async def slow_handler(frame):
+            await asyncio.sleep(0.5)
+            return "done"
+
+        agent_b.register_handler("slow", slow_handler)
+
+        await agent_a.connect(host="127.0.0.1", port=self.port)
+        await agent_b.connect(host="127.0.0.1", port=self.port)
+
+        # Agent A sends with 50ms timeout -> triggers timeout
+        with self.assertRaises(EacpRendezvousException) as ctx:
+            await MsgSend(
+                agent_a,
+                target_pin=agent_b.pin,
+                verb="slow",
+                constraints=ExecutionConstraints(timeout_ms=50),
+            )
+        self.assertEqual(ctx.exception.code, EacpError.EACP_ERR_TIMEOUT)
+
+        # Give small tick for pulse to reach relay
+        await asyncio.sleep(0.05)
+
+        # Agent A must NO LONGER be blocked in relay's deadlock graph!
+        self.assertFalse(self.relay.deadlock_graph.is_blocked(agent_a.pin))
+
+        await agent_a.close()
+        await agent_b.close()
+
 
 if __name__ == "__main__":
     unittest.main()
