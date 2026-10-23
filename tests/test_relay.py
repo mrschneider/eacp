@@ -260,6 +260,27 @@ class TestEacpRendezvousEndToEnd(unittest.IsolatedAsyncioTestCase):
         await agent_a.close()
         await agent_b.close()
 
+    async def test_relay_heartbeat_tracking(self):
+        # Configure relay with short heartbeat timeout
+        port = 18995
+        relay = EacpRelay(heartbeat_timeout_s=0.2)
+        await relay.start(port=port)
+
+        client = RSessionBase(heartbeat_interval_s=0.05)
+        await client.connect(port=port)
+
+        self.assertIn(client.pin, relay.routes)
+        session = relay.routes[client.pin]
+
+        # Let heartbeats exchange
+        t0 = session.last_seen
+        await asyncio.sleep(0.12)
+        # last_seen must be updated by heartbeats
+        self.assertGreater(session.last_seen, t0)
+
+        await client.close()
+        await relay.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

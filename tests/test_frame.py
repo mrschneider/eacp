@@ -115,6 +115,42 @@ class TestEacpFrame(unittest.TestCase):
         self.assertEqual(reply.data, "world")
         self.assertFalse(reply.flags & FrameFlags.FLAG_URGENT)
 
+    def test_transparent_compression(self):
+        # Large repetitive payload (> 1KB) should be compressed automatically
+        large_data = {"text": "A" * 5000, "tokens": list(range(500))}
+        frame = EacpFrame(
+            msg_type=MsgType.MSG_SEND,
+            verb="large_context",
+            data=large_data,
+        )
+
+        packed = frame.pack()
+        # Verify FLAG_COMPRESSED was engaged
+        unpacked = EacpFrame.unpack(packed)
+        self.assertTrue(unpacked.flags & FrameFlags.FLAG_COMPRESSED)
+        self.assertEqual(unpacked.data, large_data)
+        # Packed size should be significantly smaller than uncompressed raw text
+        self.assertLess(len(packed), 2000)
+
+    def test_max_payload_size_dos_guard(self):
+        # Frame declaring payload larger than allowed max
+        fake_header = HEADER_STRUCT.pack(
+            EACP_MAGIC,
+            1,
+            int(MsgType.MSG_SEND),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100_000,  # 100KB payload
+        )
+        with self.assertRaises(ValueError) as ctx:
+            EacpFrame.unpack(fake_header, max_payload_size=1024)  # Limit 1KB
+        self.assertIn("exceeds max allowed", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

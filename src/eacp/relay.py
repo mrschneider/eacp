@@ -13,6 +13,8 @@ import struct
 from typing import Deque, Dict, Optional, Set, Tuple
 
 from .constants import (
+    DEFAULT_HEARTBEAT_TIMEOUT_S,
+    DEFAULT_MAX_PAYLOAD_SIZE,
     EACP_MAGIC,
     HEADER_SIZE,
     EacpError,
@@ -94,6 +96,7 @@ class RelayClientSession:
         self.verifier = verifier
         self.state: int = 0  # 0: IDLE, 1: SEND_BLOCKED, 2: REPLY_BLOCKED
         self.closed: bool = False
+        self.last_seen: float = time.monotonic()
 
     async def send_frame(self, frame: EacpFrame) -> None:
         if self.writer and not self.closed:
@@ -120,14 +123,22 @@ class EacpRelay:
 
     RELAY_PIN: int = 0x0000_0000_0000_0001
 
-    def __init__(self, max_push_queue: int = 1000):
+    def __init__(
+        self,
+        max_push_queue: int = 1000,
+        max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE,
+        heartbeat_timeout_s: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
+    ):
         self.max_push_queue = max_push_queue
+        self.max_payload_size = max_payload_size
+        self.heartbeat_timeout_s = heartbeat_timeout_s
         self.routes: Dict[int, RelayClientSession] = {}
         self.verifiers: Dict[int, AgentVerifier] = {}
         self.deadlock_graph: DeadlockGraph = DeadlockGraph()
         self.push_queues: Dict[int, Deque[Tuple[float, EacpFrame]]] = {}
         self.server: Optional[asyncio.Server] = None
         self.unix_path: Optional[str] = None
+        self._reaper_task: Optional[asyncio.Task[None]] = None
         self._running: bool = False
 
     def register_agent(
@@ -184,12 +195,18 @@ class EacpRelay:
                     # Sync violation
                     break
 
+                if payload_len > self.max_payload_size:
+                    logger.warning(
+                        f"Payload length {payload_len} exceeds max payload size {self.max_payload_size}. Dropping connection."
+                    )
+                    break
+
                 # Read payload
                 payload = b""
                 if payload_len > 0:
                     payload = await reader.readexactly(payload_len)
 
-                frame = EacpFrame.unpack(hdr_bytes + payload)
+                frame = EacpFrame.unpack(hdr_bytes + payload, max_payload_size=self.max_payload_size)
 
                 # Check registration / relay control
                 if frame.msg_type == MsgType.MSG_RELAY_CONTROL and frame.opcode == OpCode.OP_RELAY_REGISTER:
@@ -219,6 +236,16 @@ class EacpRelay:
                 # Ensure sender session is established
                 if not session and registered_pin:
                     session = self.routes.get(registered_pin)
+
+                if session:
+                    session.last_seen = time.monotonic()
+
+                # If frame is a heartbeat pulse, update presence and acknowledge if requested
+                if frame.msg_type == MsgType.MSG_PULSE:
+                    code, _ = frame.get_pulse_data()
+                    if code == PulseCode.PULSE_HEARTBEAT and frame.target_pin in (0, self.RELAY_PIN):
+                        # Relay presence ping handled
+                        continue
 
                 await self.route_frame(frame, session, writer)
 
@@ -304,6 +331,22 @@ class EacpRelay:
                     self.push_queues[target_pin] = deque(maxlen=self.max_push_queue)
                 self.push_queues[target_pin].append((now, frame))
 
+    async def _heartbeat_reaper(self) -> None:
+        """Periodically prunes dead agent connections that failed heartbeat timeout."""
+        try:
+            while self._running:
+                await asyncio.sleep(min(15.0, self.heartbeat_timeout_s / 2.0))
+                now = time.monotonic()
+                for pin, session in list(self.routes.items()):
+                    if (now - session.last_seen) > self.heartbeat_timeout_s:
+                        logger.warning(
+                            f"Agent-PIN {format_pin(pin)} heartbeat timed out ({now - session.last_seen:.1f}s), closing dead route"
+                        )
+                        self.unregister_agent(pin)
+                        session.close()
+        except asyncio.CancelledError:
+            pass
+
     async def start(
         self,
         host: Optional[str] = "127.0.0.1",
@@ -321,8 +364,12 @@ class EacpRelay:
             self.server = await asyncio.start_server(self.handle_connection, host, port)
             logger.info(f"EACP Relay started on {host}:{port}")
 
+        self._reaper_task = asyncio.create_task(self._heartbeat_reaper())
+
     async def stop(self) -> None:
         self._running = False
+        if self._reaper_task and not self._reaper_task.done():
+            self._reaper_task.cancel()
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -335,3 +382,39 @@ class EacpRelay:
             session.close()
         self.routes.clear()
         self.push_queues.clear()
+
+
+def main() -> None:
+    """Portable CLI entry point to run the EACP Push Relay Daemon."""
+    import argparse
+    parser = argparse.ArgumentParser(description="EACP Push Relay Daemon (Microkernel Enterprise Mesh)")
+    parser.add_argument("--host", default="0.0.0.0", help="Listen host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8990, help="Listen port (default: 8990)")
+    parser.add_argument("--socket", default=None, help="Listen on Unix domain socket path")
+    parser.add_argument("--max-queue", type=int, default=1000, help="Max offline push queue per agent")
+    parser.add_argument("--max-payload-mb", type=int, default=16, help="Max frame payload size in MB")
+    parser.add_argument("--heartbeat-timeout", type=float, default=90.0, help="Heartbeat timeout in seconds")
+    args = parser.parse_args()
+
+    async def _run() -> None:
+        relay = EacpRelay(
+            max_push_queue=args.max_queue,
+            max_payload_size=args.max_payload_mb * 1024 * 1024,
+            heartbeat_timeout_s=args.heartbeat_timeout,
+        )
+        await relay.start(host=args.host, port=args.port, unix_path=args.socket)
+        print(f"EACP Relay listening on {args.socket if args.socket else f'{args.host}:{args.port}'}...")
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+        finally:
+            await relay.stop()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    main()

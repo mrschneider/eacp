@@ -11,6 +11,8 @@ import logging
 from typing import Any, Callable, Coroutine, Dict, Optional
 
 from .constants import (
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_MAX_PAYLOAD_SIZE,
     EACP_MAGIC,
     HEADER_SIZE,
     Capability,
@@ -40,6 +42,8 @@ class RSessionBase:
         identity: Optional[AgentIdentity] = None,
         allowed_capabilities: Capability = Capability.NONE,
         strict_mode: bool = False,
+        heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+        max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE,
     ):
         self.identity: AgentIdentity = identity or AgentIdentity.generate()
         self.manifest: SecurityManifest = SecurityManifest(
@@ -48,10 +52,13 @@ class RSessionBase:
             public_bytes=self.identity.public_bytes,
         )
         self.gate: PlatSecGate = PlatSecGate(self.manifest, strict_mode=strict_mode)
+        self.heartbeat_interval_s = heartbeat_interval_s
+        self.max_payload_size = max_payload_size
         
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
-        self._pump_task: Optional[asyncio.Task] = None
+        self._pump_task: Optional[asyncio.Task[None]] = None
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
         
         self._pending_replies: Dict[int, asyncio.Future[EacpFrame]] = {}
         self._incoming_requests: asyncio.Queue[EacpFrame] = asyncio.Queue()
@@ -114,6 +121,24 @@ class RSessionBase:
         if reply.status != EacpError.EACP_SUCCESS:
             await self.close()
             raise RuntimeError(f"Failed to register with EACP Relay: status={reply.status}")
+
+        # Start periodic keepalive heartbeat if configured
+        if self.heartbeat_interval_s > 0:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically emits heartbeat pulse to maintain presence across edge/cloud networks."""
+        try:
+            while self._connected:
+                await asyncio.sleep(self.heartbeat_interval_s)
+                if not self._connected or not self.writer:
+                    break
+                try:
+                    await self.pulse(target_pin=0, pulse_code=PulseCode.PULSE_HEARTBEAT, pulse_value=0)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
 
     async def _send_and_await_reply(self, frame: EacpFrame, timeout_ms: int = 5000) -> EacpFrame:
         if not self._connected or not self.writer:
@@ -250,11 +275,17 @@ class RSessionBase:
                     logger.error("Invalid magic in client stream")
                     break
 
+                if payload_len > self.max_payload_size:
+                    logger.error(
+                        f"Incoming payload {payload_len} exceeds max payload limit {self.max_payload_size}. Disconnecting."
+                    )
+                    break
+
                 payload = b""
                 if payload_len > 0:
                     payload = await self.reader.readexactly(payload_len)
 
-                frame = EacpFrame.unpack(hdr_bytes + payload)
+                frame = EacpFrame.unpack(hdr_bytes + payload, max_payload_size=self.max_payload_size)
 
                 # Route frame
                 if frame.msg_type == MsgType.MSG_REPLY or (frame.msg_type == MsgType.MSG_RELAY_CONTROL and frame.transaction_id in self._pending_replies):
@@ -344,6 +375,8 @@ class RSessionBase:
     async def close(self) -> None:
         """Closes client session."""
         self._connected = False
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
         if self._pump_task and not self._pump_task.done():
             self._pump_task.cancel()
         if self.writer:

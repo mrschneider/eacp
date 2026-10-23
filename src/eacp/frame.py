@@ -5,10 +5,13 @@ EACP 48-byte binary frame and 4-slot payload serializer.
 from __future__ import annotations
 import json
 import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 from .constants import (
+    COMPRESSION_THRESHOLD_BYTES,
+    DEFAULT_MAX_PAYLOAD_SIZE,
     EACP_MAGIC,
     EACP_VERSION,
     HEADER_SIZE,
@@ -126,7 +129,16 @@ class EacpFrame:
         slot3 = (self.envelope or CryptoEnvelope()).pack()
 
         lens = struct.pack(">IIII", len(slot0), len(slot1), len(slot2), len(slot3))
-        return lens + slot0 + slot1 + slot2 + slot3
+        raw_slots = lens + slot0 + slot1 + slot2 + slot3
+
+        # Transparent compression if enabled or if exceeding threshold
+        if (self.flags & FrameFlags.FLAG_COMPRESSED) or len(raw_slots) > COMPRESSION_THRESHOLD_BYTES:
+            compressed = zlib.compress(raw_slots, level=6)
+            if len(compressed) < len(raw_slots):
+                self.flags |= FrameFlags.FLAG_COMPRESSED
+                return compressed
+
+        return raw_slots
 
     @classmethod
     def unpack_slots(cls, payload: bytes) -> Tuple[str, Any, ExecutionConstraints, CryptoEnvelope]:
@@ -219,7 +231,7 @@ class EacpFrame:
         return header + payload
 
     @classmethod
-    def unpack(cls, buffer: bytes) -> EacpFrame:
+    def unpack(cls, buffer: bytes, max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE) -> EacpFrame:
         if len(buffer) < HEADER_SIZE:
             raise ValueError(f"Buffer too short for EACP header: {len(buffer)} < {HEADER_SIZE}")
         
@@ -227,6 +239,9 @@ class EacpFrame:
         
         if magic != EACP_MAGIC:
             raise ValueError(f"Invalid EACP magic: {magic!r} != {EACP_MAGIC!r}")
+
+        if payload_len > max_payload_size:
+            raise ValueError(f"Payload length {payload_len} exceeds max allowed {max_payload_size}")
 
         payload = buffer[HEADER_SIZE : HEADER_SIZE + payload_len]
         if len(payload) < payload_len:
@@ -251,7 +266,12 @@ class EacpFrame:
                 raw_payload=payload,
             )
 
-        verb, data, constraints, envelope = cls.unpack_slots(payload)
+        # Transparent decompression if FLAG_COMPRESSED is set
+        effective_payload = payload
+        if flags & FrameFlags.FLAG_COMPRESSED:
+            effective_payload = zlib.decompress(payload)
+
+        verb, data, constraints, envelope = cls.unpack_slots(effective_payload)
         return cls(
             magic=magic,
             version=ver,
@@ -267,7 +287,7 @@ class EacpFrame:
             data=data,
             constraints=constraints,
             envelope=envelope,
-            raw_payload=payload,
+            raw_payload=effective_payload,
         )
 
     def create_reply(self, status: int = EacpError.EACP_SUCCESS, result_data: Any = None) -> EacpFrame:

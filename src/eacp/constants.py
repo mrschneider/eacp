@@ -12,6 +12,12 @@ EACP_VERSION = 1
 # Header fixed length: 48 bytes (64-bit aligned)
 HEADER_SIZE = 48
 
+# Operational defaults (cloud/edge/local agnostic)
+DEFAULT_MAX_PAYLOAD_SIZE = 16 * 1024 * 1024  # 16 MB maximum payload guard
+DEFAULT_HEARTBEAT_INTERVAL_S = 30.0          # Periodic keepalive ping interval
+DEFAULT_HEARTBEAT_TIMEOUT_S = 90.0           # 3x missed heartbeat dead-route pruning
+COMPRESSION_THRESHOLD_BYTES = 1024           # Compress payloads exceeding 1KB if enabled
+
 
 class MsgType(IntEnum):
     MSG_SEND = 1          # Synchronous rendezvous request
