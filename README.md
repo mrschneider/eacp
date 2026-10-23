@@ -9,6 +9,32 @@
 
 ---
 
+## What is EACP and how does it work?
+
+EACP replaces the fragile "agents calling each other over HTTP/JSON" pattern with a battle-tested operating-system discipline: agents do not talk to each other directly — they talk to a **kernel-like relay** through synchronous, permission-checked rendezvous.
+
+![EACP Architecture — how agents communicate](docs/eacp-architecture.png)
+
+The lifecycle of a single call:
+
+1. **`MsgSend`** — Agent A (caller) sends a synchronous request addressed to Agent B's cryptographic **Agent-PIN** (a 64-bit identity derived from its Ed25519 public key — never an IP or DNS name, so agents are migratable across cloud/edge without breaking addressing). The caller blocks (rendezvous) until replied.
+2. **Route by PIN** — the **EACP-Relay** looks up the target in its PIN routing table, verifies the frame's Ed25519 signature in transit, and runs deadlock cycle detection (`A→B→C→A` is rejected before it can hang the mesh). Offline targets get their frames queued with TTL.
+3. **Permission check (PlatSec)** — before Agent B runs anything, the 64-bit capability bitmask on the frame is validated against B's signed security manifest. Insufficient capability → **denied**, and no LLM inference or tool is ever invoked — this is what makes prompt-injection privilege escalation structurally impossible.
+4. **Run handler** — the handler executes under B's cooperative `ActiveScheduler`, with its token budget escrowed upfront (over-budget work is refused before spending compute) and a hop guard against infinite delegation.
+5. **`MsgReply`** — the result travels back and unblocks the caller; the reply carries the *remaining* token budget so the delegation tree shares one envelope. Every frame is recorded in a hash-chained audit ledger.
+
+**Pulses** (heartbeat + cancel) are 8-byte out-of-band signals flowing outside the rendezvous: they keep routes alive across flaky edge links and cancel in-flight reasoning steps without blocking.
+
+### The message format
+
+Every message is a fixed **48-byte binary header** (magic, version, message type, opcode, flags, sender/target PIN, transaction ID, capability mask, status) followed by four structured slots: **Verb**, **Arguments**, **Constraints** (token budget, timeout, hop limit) and a cryptographic **Envelope** (Ed25519 signature + session handle). Binary, not JSON — deterministic, compact, and verifiable.
+
+### Enterprise capabilities baked in
+
+CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryption · W3C trace context propagation · peer relay routing (multi-cloud/edge HA) · TTL queues + heartbeats · Prometheus metrics · tamper-evident audit ledger. See the hardening table below for module-by-module details.
+
+---
+
 ## Key Pillars
 
 1. **Deterministic Concurrency (Symbian Active Objects):** Single-thread cooperative event loop per agent eliminating thread sprawl, race conditions, and uncontrolled token usage.
