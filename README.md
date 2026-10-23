@@ -69,7 +69,7 @@
 
 ## Quickstart
 
-Run test suite (35 tests):
+Run test suite (47 tests):
 ```bash
 python3 -m unittest discover tests -v
 ```
