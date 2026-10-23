@@ -4,13 +4,17 @@ EACP Security Subsystem: PlatSec capability enforcement and Ed25519 Agent-PIN id
 
 from __future__ import annotations
 import hashlib
+import os
+import ssl
 import struct
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional, Tuple
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .constants import Capability, EacpError, FrameFlags
 from .frame import CryptoEnvelope, EacpFrame
@@ -184,3 +188,116 @@ class PlatSecGate:
                 err,
                 f"PlatSec capability denied for action '{act}': required={required!r}, granted={frame.capabilities_mask & self.manifest.allowed_capabilities}",
             )
+
+
+@dataclass
+class SignedManifest:
+    """
+    Enterprise-attested Security Manifest.
+    Signed by an Enterprise CA to prevent rogue agent key registration.
+    """
+    manifest: SecurityManifest
+    ca_pin: int
+    ca_public_bytes: bytes
+    signature: bytes
+    expires_at: float
+
+    def canonical_bytes(self) -> bytes:
+        pub = self.manifest.public_bytes or b""
+        return f"{self.manifest.pin}|{int(self.manifest.allowed_capabilities)}|{self.expires_at:.2f}|".encode("utf-8") + pub
+
+    def is_valid(self) -> bool:
+        if time.time() > self.expires_at:
+            return False
+        try:
+            ca_pub = ed25519.Ed25519PublicKey.from_public_bytes(self.ca_public_bytes)
+            ca_pub.verify(self.signature, self.canonical_bytes())
+            return True
+        except Exception:
+            return False
+
+
+class EnterpriseCA:
+    """
+    Enterprise Certificate Authority for Agent-PIN registration and PlatSec manifest signing.
+    """
+
+    def __init__(self, private_key: Optional[ed25519.Ed25519PrivateKey] = None):
+        self._priv = private_key or ed25519.Ed25519PrivateKey.generate()
+        self._pub = self._priv.public_key()
+        self.public_bytes = self._pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.ca_pin = compute_pin(self.public_bytes)
+
+    def sign_manifest(self, manifest: SecurityManifest, ttl_seconds: float = 86400.0) -> SignedManifest:
+        expires_at = time.time() + ttl_seconds
+        signed_mf = SignedManifest(
+            manifest=manifest,
+            ca_pin=self.ca_pin,
+            ca_public_bytes=self.public_bytes,
+            signature=b"",
+            expires_at=expires_at,
+        )
+        sig = self._priv.sign(signed_mf.canonical_bytes())
+        signed_mf.signature = sig
+        return signed_mf
+
+
+def encrypt_payload_aes_gcm(payload: bytes, key_256: bytes) -> bytes:
+    """
+    Encrypts payload using AES-256-GCM for zero-trust confidential agent IPC (FLAG_ENCRYPTED).
+    Prefixes output with 12-byte random nonce.
+    """
+    if len(key_256) != 32:
+        raise ValueError("AES-256-GCM requires a 32-byte key")
+    aesgcm = AESGCM(key_256)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, payload, None)
+    return nonce + ciphertext
+
+
+def decrypt_payload_aes_gcm(encrypted: bytes, key_256: bytes) -> bytes:
+    """Decrypts AES-256-GCM encrypted payload."""
+    if len(encrypted) < 28:
+        raise ValueError("Encrypted buffer too short")
+    aesgcm = AESGCM(key_256)
+    nonce = encrypted[:12]
+    ciphertext = encrypted[12:]
+    return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+def create_server_ssl_context(
+    certfile: str,
+    keyfile: str,
+    ca_certfile: Optional[str] = None,
+    verify_client: bool = True,
+) -> ssl.SSLContext:
+    """Configures TLS 1.3 / mTLS server context for enterprise cloud/edge relay."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    if ca_certfile and verify_client:
+        ctx.load_verify_locations(cafile=ca_certfile)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def create_client_ssl_context(
+    certfile: Optional[str] = None,
+    keyfile: Optional[str] = None,
+    ca_certfile: Optional[str] = None,
+    verify_server: bool = True,
+) -> ssl.SSLContext:
+    """Configures TLS 1.3 / mTLS client context for enterprise agents."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if ca_certfile and verify_server:
+        ctx.load_verify_locations(cafile=ca_certfile)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    else:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    if certfile and keyfile:
+        ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+    return ctx

@@ -4,6 +4,10 @@ Microkernel-grade communication and coordination protocol for enterprise multi-a
 """
 
 from .constants import (
+    COMPRESSION_THRESHOLD_BYTES,
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_HEARTBEAT_TIMEOUT_S,
+    DEFAULT_MAX_PAYLOAD_SIZE,
     EACP_MAGIC,
     EACP_VERSION,
     HEADER_SIZE,
@@ -24,10 +28,16 @@ from .frame import (
 from .security import (
     AgentIdentity,
     AgentVerifier,
+    EnterpriseCA,
     PlatSecException,
     PlatSecGate,
     SecurityManifest,
+    SignedManifest,
     compute_pin,
+    create_client_ssl_context,
+    create_server_ssl_context,
+    decrypt_payload_aes_gcm,
+    encrypt_payload_aes_gcm,
     format_pin,
 )
 from .scheduler import (
@@ -54,12 +64,28 @@ from .relay import (
 from .client import (
     RSessionBase,
 )
+from .telemetry import (
+    EacpMetrics,
+    TraceContext,
+)
+from .ledger import (
+    AuditEntry,
+    AuditLedger,
+)
+from .mesh import (
+    MeshRoutingTable,
+    RelayPeer,
+)
 
 __all__ = [
     # Constants
     "EACP_MAGIC",
     "EACP_VERSION",
     "HEADER_SIZE",
+    "DEFAULT_MAX_PAYLOAD_SIZE",
+    "DEFAULT_HEARTBEAT_INTERVAL_S",
+    "DEFAULT_HEARTBEAT_TIMEOUT_S",
+    "COMPRESSION_THRESHOLD_BYTES",
     "ActivePriority",
     "Capability",
     "EacpError",
@@ -72,13 +98,19 @@ __all__ = [
     "CryptoEnvelope",
     "EacpFrame",
     "ExecutionConstraints",
-    # Security
+    # Security & Enterprise PKI
     "AgentIdentity",
     "AgentVerifier",
+    "EnterpriseCA",
     "PlatSecException",
     "PlatSecGate",
     "SecurityManifest",
+    "SignedManifest",
     "compute_pin",
+    "create_client_ssl_context",
+    "create_server_ssl_context",
+    "decrypt_payload_aes_gcm",
+    "encrypt_payload_aes_gcm",
     "format_pin",
     # Scheduler
     "ActiveScheduler",
@@ -100,4 +132,13 @@ __all__ = [
     "RelayClientSession",
     # Client
     "RSessionBase",
+    # Enterprise Telemetry
+    "EacpMetrics",
+    "TraceContext",
+    # Enterprise Audit Ledger
+    "AuditEntry",
+    "AuditLedger",
+    # Enterprise HA Mesh
+    "MeshRoutingTable",
+    "RelayPeer",
 ]

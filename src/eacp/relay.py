@@ -10,13 +10,15 @@ import time
 from collections import deque
 import logging
 import struct
-from typing import Deque, Dict, Optional, Set, Tuple
+import ssl
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from .constants import (
     DEFAULT_HEARTBEAT_TIMEOUT_S,
     DEFAULT_MAX_PAYLOAD_SIZE,
     EACP_MAGIC,
     HEADER_SIZE,
+    Capability,
     EacpError,
     FrameFlags,
     MsgType,
@@ -24,7 +26,10 @@ from .constants import (
     PulseCode,
 )
 from .frame import EacpFrame, HEADER_STRUCT
-from .security import AgentVerifier, format_pin
+from .ledger import AuditLedger
+from .mesh import MeshRoutingTable, RelayPeer
+from .security import AgentVerifier, EnterpriseCA, SecurityManifest, SignedManifest, format_pin
+from .telemetry import EacpMetrics, TraceContext
 
 logger = logging.getLogger("eacp.relay")
 
@@ -125,13 +130,18 @@ class EacpRelay:
 
     def __init__(
         self,
+        relay_id: str = "relay-1",
         max_push_queue: int = 1000,
         max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE,
         heartbeat_timeout_s: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
+        enterprise_ca: Optional[EnterpriseCA] = None,
+        audit_file_path: Optional[str] = None,
     ):
+        self.relay_id = relay_id
         self.max_push_queue = max_push_queue
         self.max_payload_size = max_payload_size
         self.heartbeat_timeout_s = heartbeat_timeout_s
+        self.enterprise_ca = enterprise_ca
         self.routes: Dict[int, RelayClientSession] = {}
         self.verifiers: Dict[int, AgentVerifier] = {}
         self.deadlock_graph: DeadlockGraph = DeadlockGraph()
@@ -141,6 +151,11 @@ class EacpRelay:
         self._reaper_task: Optional[asyncio.Task[None]] = None
         self._running: bool = False
 
+        # Enterprise extensions
+        self.metrics: EacpMetrics = EacpMetrics()
+        self.ledger: AuditLedger = AuditLedger(file_path=audit_file_path)
+        self.mesh: MeshRoutingTable = MeshRoutingTable(local_relay_id=relay_id)
+
     def register_agent(
         self,
         pin: int,
@@ -148,6 +163,8 @@ class EacpRelay:
         verifier: Optional[AgentVerifier] = None,
     ) -> None:
         self.routes[pin] = session
+        self.mesh.register_local(pin)
+        self.metrics.registered_agents.set(len(self.routes))
         if verifier:
             self.verifiers[pin] = verifier
             session.verifier = verifier
@@ -173,7 +190,9 @@ class EacpRelay:
 
     def unregister_agent(self, pin: int) -> None:
         self.routes.pop(pin, None)
+        self.mesh.unregister(pin)
         self.deadlock_graph.remove_agent(pin)
+        self.metrics.registered_agents.set(len(self.routes))
 
     async def handle_connection(
         self,
@@ -211,6 +230,40 @@ class EacpRelay:
                 # Check registration / relay control
                 if frame.msg_type == MsgType.MSG_RELAY_CONTROL and frame.opcode == OpCode.OP_RELAY_REGISTER:
                     registered_pin = frame.sender_pin
+
+                    # Enterprise CA enforcement
+                    if self.enterprise_ca:
+                        valid = False
+                        if isinstance(frame.data, dict) and "signed_manifest" in frame.data:
+                            try:
+                                sm_d = frame.data["signed_manifest"]
+                                sm = SignedManifest(
+                                    manifest=SecurityManifest(
+                                        pin=sm_d["pin"],
+                                        allowed_capabilities=Capability(sm_d["allowed_capabilities"]),
+                                        public_bytes=bytes.fromhex(sm_d["public_bytes"]),
+                                    ),
+                                    ca_pin=sm_d["ca_pin"],
+                                    ca_public_bytes=bytes.fromhex(sm_d["ca_public_bytes"]),
+                                    signature=bytes.fromhex(sm_d["signature"]),
+                                    expires_at=sm_d["expires_at"],
+                                )
+                                if sm.is_valid() and sm.ca_pin == self.enterprise_ca.ca_pin:
+                                    valid = True
+                            except Exception as e:
+                                logger.warning(f"SignedManifest validation error: {e}")
+                                valid = False
+                        
+                        if not valid:
+                            self.metrics.platsec_denials.inc(action="register")
+                            err_ack = frame.create_reply(
+                                status=EacpError.EACP_ERR_CAPABILITY_DENIED,
+                                result_data={"error": "Registration refused: missing or invalid Enterprise CA signature"},
+                            )
+                            writer.write(err_ack.pack())
+                            await writer.drain()
+                            continue
+
                     verifier = None
                     # If public key attached in frame.data or slot 1
                     if isinstance(frame.data, dict) and "pub_bytes" in frame.data:
@@ -273,6 +326,18 @@ class EacpRelay:
         sender_pin = frame.sender_pin
         target_pin = frame.target_pin
 
+        # Audit ledger record & metrics tracking
+        self.ledger.record(
+            tx_id=frame.transaction_id,
+            sender_pin=sender_pin,
+            target_pin=target_pin,
+            verb=frame.verb,
+            capabilities_mask=frame.capabilities_mask,
+            status=int(frame.status),
+            data_payload=frame.raw_payload,
+        )
+        self.metrics.frames_total.inc(type=frame.msg_type.name, status=str(int(frame.status)))
+
         # 1. Verification: if verifier exists for sender, check signature
         if (frame.flags & FrameFlags.FLAG_SIGNED) and sender_pin in self.verifiers:
             verifier = self.verifiers[sender_pin]
@@ -288,6 +353,7 @@ class EacpRelay:
             # Check deadlock cycle before routing
             if not self.deadlock_graph.add_dependency(sender_pin, target_pin):
                 # Deadlock detected! Reply immediately with error
+                self.metrics.deadlocks_prevented.inc()
                 err_reply = frame.create_reply(status=EacpError.EACP_ERR_DEADLOCK_DETECTED)
                 if sender_session:
                     await sender_session.send_frame(err_reply)
@@ -303,33 +369,40 @@ class EacpRelay:
                 # Cancel frees sender's in-flight dependency
                 self.deadlock_graph.remove_dependency(sender_pin)
 
-        # 3. Route to target
+        # 3. Route to target (Local session or Remote Peer in Mesh)
         target_session = self.routes.get(target_pin)
         if target_session and not target_session.closed:
             await target_session.send_frame(frame)
-        else:
-            # Target is offline
-            now = time.monotonic()
-            if frame.msg_type == MsgType.MSG_SEND:
-                # If urgent or no buffering allowed, return unknown PIN immediately
-                if frame.flags & FrameFlags.FLAG_URGENT:
-                    self.deadlock_graph.remove_dependency(sender_pin)
-                    if sender_session:
-                        err_reply = frame.create_reply(status=EacpError.EACP_ERR_UNKNOWN_PIN)
-                        await sender_session.send_frame(err_reply)
-                else:
-                    # Buffer message in push queue
-                    if target_pin not in self.push_queues:
-                        self.push_queues[target_pin] = deque(maxlen=self.max_push_queue)
-                    self.push_queues[target_pin].append((now, frame))
-            elif frame.msg_type in (MsgType.MSG_PULSE, MsgType.MSG_REPLY):
-                # For replies where target is lost, clear deadlock edge
-                if frame.msg_type == MsgType.MSG_REPLY:
-                    self.deadlock_graph.remove_dependency(target_pin)
-                # Store pulse or drop
+            return
+
+        # Check peer mesh routing
+        peer = self.mesh.get_peer_for_pin(target_pin)
+        if peer and peer.connected:
+            await peer.send_frame(frame)
+            return
+
+        # Target is offline
+        now = time.monotonic()
+        if frame.msg_type == MsgType.MSG_SEND:
+            # If urgent or no buffering allowed, return unknown PIN immediately
+            if frame.flags & FrameFlags.FLAG_URGENT:
+                self.deadlock_graph.remove_dependency(sender_pin)
+                if sender_session:
+                    err_reply = frame.create_reply(status=EacpError.EACP_ERR_UNKNOWN_PIN)
+                    await sender_session.send_frame(err_reply)
+            else:
+                # Buffer message in push queue
                 if target_pin not in self.push_queues:
                     self.push_queues[target_pin] = deque(maxlen=self.max_push_queue)
                 self.push_queues[target_pin].append((now, frame))
+        elif frame.msg_type in (MsgType.MSG_PULSE, MsgType.MSG_REPLY):
+            # For replies where target is lost, clear deadlock edge
+            if frame.msg_type == MsgType.MSG_REPLY:
+                self.deadlock_graph.remove_dependency(target_pin)
+            # Store pulse or drop
+            if target_pin not in self.push_queues:
+                self.push_queues[target_pin] = deque(maxlen=self.max_push_queue)
+            self.push_queues[target_pin].append((now, frame))
 
     async def _heartbeat_reaper(self) -> None:
         """Periodically prunes dead agent connections that failed heartbeat timeout."""
@@ -352,6 +425,7 @@ class EacpRelay:
         host: Optional[str] = "127.0.0.1",
         port: Optional[int] = 8990,
         unix_path: Optional[str] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         self._running = True
         self.unix_path = unix_path
@@ -361,8 +435,9 @@ class EacpRelay:
             self.server = await asyncio.start_unix_server(self.handle_connection, path=unix_path)
             logger.info(f"EACP Relay started on unix socket {unix_path}")
         elif host is not None and port is not None:
-            self.server = await asyncio.start_server(self.handle_connection, host, port)
-            logger.info(f"EACP Relay started on {host}:{port}")
+            self.server = await asyncio.start_server(self.handle_connection, host, port, ssl=ssl_context)
+            proto = "mTLS/TLS" if ssl_context else "TCP"
+            logger.info(f"EACP Relay started on {host}:{port} ({proto})")
 
         self._reaper_task = asyncio.create_task(self._heartbeat_reaper())
 

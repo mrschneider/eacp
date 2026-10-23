@@ -28,6 +28,7 @@ async def MsgSend(
     constraints: Optional[ExecutionConstraints] = None,
     opcode: int = OpCode.OP_ACTION_INVOKE,
     capabilities_mask: Optional[int] = None,
+    trace_context: Optional[Any] = None,
 ) -> EacpFrame:
     """
     Synchronous rendezvous request:
@@ -41,6 +42,7 @@ async def MsgSend(
         constraints=constraints,
         opcode=opcode,
         capabilities_mask=capabilities_mask,
+        trace_context=trace_context,
     )
 
 

@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import itertools
 import logging
+import ssl
 from typing import Any, Callable, Coroutine, Dict, Optional
 
 from .constants import (
@@ -24,7 +25,8 @@ from .constants import (
 )
 from .frame import CryptoEnvelope, EacpFrame, ExecutionConstraints, HEADER_STRUCT
 from .primitives import EacpRendezvousException
-from .security import AgentIdentity, PlatSecGate, SecurityManifest, format_pin
+from .security import AgentIdentity, PlatSecGate, SecurityManifest, SignedManifest, format_pin
+from .telemetry import TraceContext
 
 logger = logging.getLogger("eacp.client")
 
@@ -42,14 +44,20 @@ class RSessionBase:
         identity: Optional[AgentIdentity] = None,
         allowed_capabilities: Capability = Capability.NONE,
         strict_mode: bool = False,
+        signed_manifest: Optional[SignedManifest] = None,
         heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
         max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE,
     ):
         self.identity: AgentIdentity = identity or AgentIdentity.generate()
-        self.manifest: SecurityManifest = SecurityManifest(
-            pin=self.identity.pin,
-            allowed_capabilities=allowed_capabilities,
-            public_bytes=self.identity.public_bytes,
+        self.signed_manifest = signed_manifest
+        self.manifest: SecurityManifest = (
+            signed_manifest.manifest
+            if signed_manifest
+            else SecurityManifest(
+                pin=self.identity.pin,
+                allowed_capabilities=allowed_capabilities,
+                public_bytes=self.identity.public_bytes,
+            )
         )
         self.gate: PlatSecGate = PlatSecGate(self.manifest, strict_mode=strict_mode)
         self.heartbeat_interval_s = heartbeat_interval_s
@@ -96,14 +104,29 @@ class RSessionBase:
         host: Optional[str] = "127.0.0.1",
         port: Optional[int] = 8990,
         unix_path: Optional[str] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
-        """Connects to EACP Relay via TCP or Unix Domain Socket and performs registration."""
+        """Connects to EACP Relay via TCP/mTLS or Unix Domain Socket and performs registration."""
         if unix_path:
             self.reader, self.writer = await asyncio.open_unix_connection(unix_path)
         else:
-            self.reader, self.writer = await asyncio.open_connection(host or "127.0.0.1", port or 8990)
+            self.reader, self.writer = await asyncio.open_connection(
+                host or "127.0.0.1", port or 8990, ssl=ssl_context
+            )
         self._connected = True
         self._pump_task = asyncio.create_task(self._frame_pump())
+
+        reg_data: Dict[str, Any] = {"pub_bytes": self.identity.public_bytes.hex()}
+        if self.signed_manifest:
+            reg_data["signed_manifest"] = {
+                "pin": self.signed_manifest.manifest.pin,
+                "allowed_capabilities": int(self.signed_manifest.manifest.allowed_capabilities),
+                "public_bytes": self.signed_manifest.manifest.public_bytes.hex() if self.signed_manifest.manifest.public_bytes else "",
+                "ca_pin": self.signed_manifest.ca_pin,
+                "ca_public_bytes": self.signed_manifest.ca_public_bytes.hex(),
+                "signature": self.signed_manifest.signature.hex(),
+                "expires_at": self.signed_manifest.expires_at,
+            }
 
         # Send registration frame
         reg_frame = EacpFrame(
@@ -113,7 +136,7 @@ class RSessionBase:
             target_pin=0,
             transaction_id=next(self._tx_counter),
             capabilities_mask=int(self.manifest.allowed_capabilities),
-            data={"pub_bytes": self.identity.public_bytes.hex()},
+            data=reg_data,
         )
         self.identity.sign_frame(reg_frame)
 
@@ -184,6 +207,7 @@ class RSessionBase:
         constraints: Optional[ExecutionConstraints] = None,
         opcode: int = OpCode.OP_ACTION_INVOKE,
         capabilities_mask: Optional[int] = None,
+        trace_context: Optional[TraceContext] = None,
     ) -> EacpFrame:
         """
         Emits synchronous MsgSend rendezvous request.
@@ -191,6 +215,7 @@ class RSessionBase:
         """
         constr = constraints or ExecutionConstraints()
         cap_mask = capabilities_mask if capabilities_mask is not None else int(self.manifest.allowed_capabilities)
+        tc = trace_context or TraceContext.new_root()
 
         frame = EacpFrame(
             msg_type=MsgType.MSG_SEND,
