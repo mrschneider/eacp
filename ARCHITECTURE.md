@@ -271,3 +271,19 @@ The **EACP-Relay** functions analogously to the BlackBerry Enterprise Server (BE
 | `6` | `0x0006` | `EACP_ERR_CANCELLED` | Operation cancelled via `MsgPulse` |
 | `7` | `0x0007` | `EACP_ERR_TOKEN_OVERFLOW` | Execution exceeded token budget constraint |
 | `8` | `0x0008` | `EACP_ERR_SIGNATURE_INVALID` | Ed25519 signature verification failure |
+
+---
+
+## 10. Tactical & Military Resiliency Layer
+
+### 10.1 OMG DDS / C4I Quality of Service (QoS) Contract Model
+EACP adopts the contractual Requested vs. Offered (RxO) quality-of-service model from military C4I command systems:
+* **RxO Contract Evaluator (`QosContractEvaluator`):** Ensures a consumer agent's requested reliability, durability, deadline, and latency constraints can only bind to a producer offering equal or strictly stronger contractual guarantees.
+* **Exclusive Ownership Arbitration (`OwnershipArbitrator`):** Provides deterministic, preemption-capable leadership arbitration for critical execution roles or topics based on assigned ownership strength (0..1000). If the active primary agent misses its liveliness heartbeat lease window, ownership automatically fails over to the next highest-strength live candidate.
+* **Deadline Monitoring (`DeadlineMonitor`):** Tracks end-to-end rendezvous and asynchronous processing turnaround against contractual latency budgets, raising actionable alerts upon deadline breach.
+
+### 10.2 RFC 9171 / DARPA DTN Bundle Protocol Custody Transfer
+To ensure uninterrupted coordination across partitioned, contested, or intermittent edge links:
+* **Custody Transfer Handover (`CustodyStore`):** Uses RFC 9171 store-and-forward semantics with atomic custody transfer (`CUSTODY_ACCEPTED`). An upstream agent retains message custody until downstream explicitly acknowledges custody responsibility.
+* **Resiliency Controls:** Bounded buffer memory accounting, duplicate suppression rings, hop limit guards against routing cycles, and proactive TTL expiration pruning prevent message loss and memory starvation across severed WAN/edge mesh topologies.
+

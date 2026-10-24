@@ -59,6 +59,8 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 | Hop Guard | `client.py` | `max_depth_hops` decremental enforcement prevents infinite agent delegation |
 | Token Budget Escrow | `budget.py` | Kernel-style escrow/settle/refund ledger with pluggable `TokenMeter`, ledger capacity and `EACP_ERR_TOKEN_OVERFLOW` |
 | Fail-Closed PlatSec | `security.py` | `strict_mode=True` rejects any action not registered in the manifest |
+| DDS C4I QoS Contract | `qos.py` | Requested vs Offered (RxO) contract validation + exclusive ownership arbitration with failover |
+| DTN Store-and-Forward | `dtn.py` | RFC 9171 / DARPA Bundle Protocol custody transfer, duplicate suppression & hop limits |
 
 ---
 
@@ -87,20 +89,23 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 │       ├── telemetry.py     # W3C TraceContext + Prometheus metrics
 │       ├── ledger.py        # Immutable append-only audit ledger
 │       ├── mesh.py          # Multi-relay HA peer mesh routing
+│       ├── qos.py           # DDS C4I QoS policies, RxO compatibility & ownership failover
+│       ├── dtn.py           # RFC 9171 DTN store-and-forward custody transfer
 │       └── __main__.py      # `python3 -m eacp` CLI entry point
 └── tests/
     ├── test_frame.py        # Binary wire serialization tests
     ├── test_security.py     # PlatSec & capability verification tests
     ├── test_scheduler.py    # ActiveScheduler & cleanup stack tests
     ├── test_relay.py        # End-to-end multi-agent IPC rendezvous tests
-    └── test_enterprise.py   # Enterprise pillars: encryption, tracing, PKI, mesh, audit
+    ├── test_enterprise.py   # Enterprise pillars: encryption, tracing, PKI, mesh, audit
+    └── test_tactical.py     # Tactical resiliency: DDS QoS arbitration & DTN custody transfer
 ```
 
 ---
 
 ## Quickstart
 
-Run test suite (47 tests):
+Run test suite (54 tests):
 ```bash
 python3 -m unittest discover tests -v
 ```

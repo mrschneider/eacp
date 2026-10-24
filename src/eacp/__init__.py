@@ -82,6 +82,23 @@ from .mesh import (
     MeshRoutingTable,
     RelayPeer,
 )
+from .qos import (
+    DurabilityKind,
+    LivelinessKind,
+    OwnershipArbitrator,
+    OwnershipKind,
+    QosContractEvaluator,
+    QosProfile,
+    QosViolation,
+    ReliabilityKind,
+)
+from .dtn import (
+    Bundle,
+    CustodyRefusalReason,
+    CustodyReport,
+    CustodySignal,
+    CustodyStore,
+)
 
 __all__ = [
     # Constants
@@ -152,4 +169,19 @@ __all__ = [
     # Enterprise HA Mesh
     "MeshRoutingTable",
     "RelayPeer",
+    # Military C4I QoS & Ownership Arbitration
+    "DurabilityKind",
+    "LivelinessKind",
+    "OwnershipArbitrator",
+    "OwnershipKind",
+    "QosContractEvaluator",
+    "QosProfile",
+    "QosViolation",
+    "ReliabilityKind",
+    # Military DTN Bundle Protocol Custody
+    "Bundle",
+    "CustodyRefusalReason",
+    "CustodyReport",
+    "CustodySignal",
+    "CustodyStore",
 ]
