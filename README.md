@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Code Style](https://img.shields.io/badge/wire%20format-48%20byte%20binary-orange)
 
-**EACP** is a microkernel-grade communication and coordination protocol for enterprise multi-agent systems. It inherits and fuses the concurrency and security architectures of **Symbian OS (EKA2)** with the synchronous rendezvous and push-relay architecture of **BlackBerry OS / QNX Neutrino**.
+**EACP** is a microkernel-grade communication and coordination protocol for enterprise multi-agent systems. It fuses deterministic cooperative concurrency and capability-based security (PlatSec) with synchronous rendezvous IPC (QNX Neutrino) and cryptographic PIN-routed push delivery.
 
 ---
 
@@ -37,10 +37,10 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 
 ## Key Pillars
 
-1. **Deterministic Concurrency (Symbian Active Objects):** Single-thread cooperative event loop per agent eliminating thread sprawl, race conditions, and uncontrolled token usage.
-2. **Platform Security (Symbian PlatSec):** 64-bit capability bitmask validated at the protocol frame layer before any action or tool executes.
+1. **Deterministic Concurrency (Active Objects):** Single-thread cooperative event loop per agent eliminating thread sprawl, race conditions, and uncontrolled token usage.
+2. **Platform Security (PlatSec):** 64-bit capability bitmask validated at the protocol frame layer before any action or tool executes.
 3. **Synchronous Rendezvous (QNX Neutrino IPC):** `MsgSend` / `MsgReceive` / `MsgReply` protocol lifecycle with built-in deadlock cycle detection.
-4. **Agent-PIN Cryptographic Addressing (BlackBerry BES):** Global 64-bit cryptographic addressing independent of IP/DNS, routed transparently across cloud and edge topologies via the EACP-Relay.
+4. **Agent-PIN Cryptographic Addressing:** Global 64-bit cryptographic addressing independent of IP/DNS, routed transparently across cloud and edge topologies via the EACP-Relay.
 
 ---
 
@@ -86,7 +86,7 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 │       ├── constants.py     # OpCodes, MsgTypes, Capabilities & Error codes
 │       ├── frame.py         # 48-byte binary header & slot serializer
 │       ├── security.py      # Ed25519 identity, PlatSec gates, Enterprise CA, AES-GCM
-│       ├── scheduler.py     # Symbian ActiveScheduler, CActive, CleanupStack, AsyncActive
+│       ├── scheduler.py     # ActiveScheduler, CActive, CleanupStack, AsyncActive
 │       ├── primitives.py    # QNX rendezvous primitives (MsgSend, MsgReceive, MsgReply, MsgPulse)
 │       ├── relay.py         # Push relay daemon, deadlock graph, heartbeat reaper, CLI
 │       ├── client.py        # Agent RSessionBase client wrapper

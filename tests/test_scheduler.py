@@ -1,5 +1,5 @@
 """
-Unit tests for Symbian ActiveScheduler, CActive objects, and CleanupStack.
+Unit tests for ActiveScheduler, CActive objects, and CleanupStack.
 """
 
 import asyncio

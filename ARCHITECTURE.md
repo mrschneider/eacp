@@ -16,16 +16,16 @@ Modern multi-agent architectures (CrewAI, AutoGen, LangGraph, Swarm) suffer from
 4. **Fragile Network Addressing:** Agent discovery bound to transient IP addresses or DNS names breaks across hybrid clusters, containers, and edge topologies.
 
 ### 1.2 The Microkernel Pedigree
-EACP solves multi-agent coordination by importing proven primitives from two battle-tested mobile/embedded microkernel operating systems:
-* **Symbian OS (EKA2):**
+EACP solves multi-agent coordination by importing proven primitives from battle-tested microkernel operating systems:
+* **Cooperative Event-Loop & Capability Architecture:**
   * *Active Objects & Active Scheduler:* Non-preemptive, cooperative FSM concurrency within a single thread. Eliminates locking contention and guarantees deterministic cancellation.
   * *Client-Server Architecture (`RMessage2` / `RSessionBase`):* Strict IPC message slots (`TIpcArgs`) separating verb, arguments, constraints, and context.
   * *Platform Security (PlatSec):* Fine-grained, bitmask-enforced capabilities required for any IPC dispatch.
   * *CleanupStack & Two-Phase Construction:* Automatic resource recovery and state rollback upon execution failure.
-* **BlackBerry OS & QNX Neutrino:**
-  * *Synchronous Rendezvous (`MsgSend / MsgReceive / MsgReply`):* Controlled blocking coordination that eliminates race conditions and enforces strict sequencing.
+* **Microkernel IPC & Cryptographic Push Architecture:**
+  * *Synchronous Rendezvous (`MsgSend / MsgReceive / MsgReply`):* Controlled blocking coordination that eliminates race conditions and enforces strict sequencing (QNX Neutrino).
   * *Pulses:* Ultra-lightweight, non-blocking 8-byte out-of-band signals for cancellations and heartbeats.
-  * *PIN-based Routing & Enterprise Push Relay (BES/MDS):* Addressing bound to cryptographic agent identities (Agent-PIN), routing messages transparently across heterogeneous clouds, on-prem nodes, and edge devices.
+  * *PIN-based Routing & Enterprise Push Relay:* Addressing bound to cryptographic agent identities (Agent-PIN), routing messages transparently across heterogeneous clouds, on-prem nodes, and edge devices.
 
 ---
 
@@ -38,13 +38,13 @@ EACP is divided into five formal layers:
 | Layer 4: Application & Agentic Task Ledger                              |
 |   - Task decomposition, token budgeting, prompt state, tool registry   |
 +-------------------------------------------------------------------------+
-| Layer 3: EACP Concurrency Runtime (Symbian ActiveScheduler)             |
+| Layer 3: EACP Concurrency Runtime (ActiveScheduler)                     |
 |   - CActive objects, TRequestStatus, RunL(), DoCancel(), CleanupStack   |
 +-------------------------------------------------------------------------+
 | Layer 2: IPC & Platform Security (PlatSec + QNX Rendezvous)             |
 |   - RSessionBase, MsgSend, MsgReceive, MsgReply, MsgPulse, Capabilities |
 +-------------------------------------------------------------------------+
-| Layer 1: Cryptographic Addressing & Push Relay (BlackBerry PIN / BES)   |
+| Layer 1: Cryptographic Addressing & Push Relay (Agent-PIN Mesh)         |
 |   - Agent-PIN routing table, presence beacons, rendezvous broker        |
 +-------------------------------------------------------------------------+
 | Layer 0: Abstract Transport                                             |
@@ -123,7 +123,7 @@ All EACP frames are transmitted in network byte order (big-endian). A frame cons
 
 ---
 
-### 4.2 Payload Slot Architecture (Symbian `TIpcArgs`)
+### 4.2 Payload Slot Architecture (Structured `TIpcArgs`)
 
 The payload following the 32-byte header is structured into four explicit slots:
 
@@ -181,7 +181,7 @@ The rejection occurs immediately in the L2 runtime. The underlying LLM is never 
 
 ## 6. Concurrency Runtime: The Active Scheduler
 
-To prevent thread bloat and race conditions, EACP agent engines run on a single-thread cooperative event loop modeled on Symbian EKA2.
+To prevent thread bloat and race conditions, EACP agent engines run on a single-thread cooperative event loop with deterministic priority scheduling.
 
 ### 6.1 State Machine & Core Classes
 
@@ -238,7 +238,7 @@ For immediate interrupts that cannot wait for rendezvous:
 
 ## 8. Network Relay & Push Architecture (EACP-Relay)
 
-The **EACP-Relay** functions analogously to the BlackBerry Enterprise Server (BES):
+The **EACP-Relay** functions as an enterprise push router and rendezvous broker:
 
 ```
 [Agent A (AWS Cloud)]       [Agent B (Node .70)]        [Agent C (Edge Node)]

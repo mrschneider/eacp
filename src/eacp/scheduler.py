@@ -1,5 +1,5 @@
 """
-EACP Concurrency Subsystem: Symbian EKA2 ActiveScheduler, CActive objects, and CleanupStack.
+EACP Concurrency Subsystem: Deterministic ActiveScheduler, CActive objects, and CleanupStack.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class CleanupItem:
 
 class CleanupStack:
     """
-    Symbian-style CleanupStack for two-phase resource management and deterministic rollback.
+    Deterministic CleanupStack for two-phase resource management and deterministic rollback.
     """
 
     def __init__(self):
@@ -103,7 +103,7 @@ class CleanupStack:
 
 class CActive:
     """
-    Symbian CActive base class for non-preemptive cooperative event handling.
+    CActive base class for non-preemptive cooperative event handling.
     """
 
     def __init__(self, priority: ActivePriority = ActivePriority.EPriorityStandard):
@@ -149,7 +149,7 @@ class CActive:
 
 class ActiveScheduler:
     """
-    Symbian ActiveScheduler: cooperative non-preemptive priority scheduler.
+    ActiveScheduler: cooperative non-preemptive priority scheduler.
     """
 
     _current: Optional[ActiveScheduler] = None
@@ -221,7 +221,7 @@ class ActiveScheduler:
 
 class AsyncActive(CActive):
     """
-    Bridge connecting an asyncio coroutine/Task to Symbian CActive Active Object.
+    Bridge connecting an asyncio coroutine/Task to a CActive Active Object.
     When the async operation completes, triggers RunL() with deterministic CleanupStack rollback.
     """
 
@@ -264,7 +264,7 @@ class AsyncActive(CActive):
 
 class AsyncActiveScheduler(ActiveScheduler):
     """
-    Asynchronous Symbian ActiveScheduler running natively within an asyncio event loop.
+    Asynchronous ActiveScheduler running natively within an asyncio event loop.
     Dispatches highest-priority ready CActive objects non-preemptively.
     """
 

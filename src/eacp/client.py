@@ -1,6 +1,6 @@
 """
-EACP Agent Client Subsystem: Symbian-style RSessionBase client handle,
-PlatSec gate integration, and asynchronous frame pump.
+EACP Agent Client Subsystem: RSessionBase client handle,
+out-of-band pulse emission, and active dispatch loop.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ logger = logging.getLogger("eacp.client")
 
 class RSessionBase:
     """
-    Symbian RSessionBase client handle connecting an agent to the EACP-Relay.
+    RSessionBase client handle connecting an agent to the EACP-Relay.
     Provides synchronous rendezvous primitives and PlatSec gate enforcement.
     """
 

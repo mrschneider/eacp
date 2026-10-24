@@ -1,5 +1,5 @@
 """
-EACP-Relay: BlackBerry BES/QNX rendezvous router, PIN routing table,
+EACP-Relay: Microkernel rendezvous router, cryptographic PIN routing table,
 offline push buffering, and cycle deadlock detection.
 """
 
@@ -123,7 +123,7 @@ class EacpRelay:
     EACP Push Relay Server.
     - Manages Agent-PIN registration and routing table.
     - Enforces QNX synchronous rendezvous & deadlock detection.
-    - Buffers offline messages (BlackBerry BES push architecture).
+    - Buffers offline messages (push architecture).
     """
 
     RELAY_PIN: int = 0x0000_0000_0000_0001

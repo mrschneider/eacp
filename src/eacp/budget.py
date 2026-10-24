@@ -1,7 +1,7 @@
 """
 EACP Token Budget Enforcement — kernel-resource accounting model.
 
-Design (mirrors Symbian memory allocator + QNX resource manager semantics):
+Design (mirrors microkernel memory allocator + QNX resource manager semantics):
 
 1. **Escrow model** — a handler never spends tokens directly. On dispatch the
    runtime reserves (escrows) the frame's `token_budget` against the agent's
