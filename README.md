@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Code Style](https://img.shields.io/badge/wire%20format-48%20byte%20binary-orange)
 
-**EACP** is a microkernel-grade communication and coordination protocol for enterprise multi-agent systems. It fuses the concurrency and security architectures of **Symbian OS (EKA2)** with the synchronous rendezvous and push-relay architecture of **BlackBerry OS / QNX Neutrino**.
+**EACP** is a microkernel-grade communication and coordination protocol for enterprise multi-agent systems. It inherits and fuses the concurrency and security architectures of **Symbian OS (EKA2)** with the synchronous rendezvous and push-relay architecture of **BlackBerry OS / QNX Neutrino**.
 
 ---
 
