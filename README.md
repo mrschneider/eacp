@@ -76,6 +76,10 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 │   ├── generate.py          # Deterministic vector generator
 │   ├── verify.py            # Independent strict consumer / self-check
 │   └── vectors.json         # Byte-exact ground truth
+├── crates/
+│   └── eacp-relay/          # High-performance native Rust microkernel relay daemon
+│       ├── Cargo.toml
+│       └── src/             # Tokio async event loop, zero-copy wire parser, deadlock engine
 ├── src/
 │   └── eacp/
 │       ├── __init__.py      # Package export
@@ -112,14 +116,11 @@ python3 -m unittest discover tests -v
 
 Run the EACP-Relay daemon:
 ```bash
-# TCP (LAN/VPC/Cloud)
+# High-performance native Rust Relay (sub-millisecond deterministic latency, zero GC)
+cargo run --release --manifest-path crates/eacp-relay/Cargo.toml -- --port 8990
+
+# Or portable pure-Python Relay
 python3 -m eacp.relay --host 0.0.0.0 --port 8990
-
-# Unix Domain Socket (local IPC)
-python3 -m eacp.relay --socket /run/eacp.sock
-
-# Tuned for edge devices
-python3 -m eacp.relay --max-queue 500 --max-payload-mb 4 --heartbeat-timeout 60
 ```
 
 Minimal agent example:

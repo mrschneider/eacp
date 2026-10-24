@@ -61,3 +61,16 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  rust-relay:
+    name: Rust Relay (cargo test & build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo test
+        run: cargo test --manifest-path crates/eacp-relay/Cargo.toml
+      - name: Build release binary
+        run: cargo build --release --manifest-path crates/eacp-relay/Cargo.toml
+

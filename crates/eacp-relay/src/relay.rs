@@ -1,0 +1,292 @@
+//! EACP High-Performance Relay Server Core.
+
+use bytes::Bytes;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing::{debug, info, warn};
+
+use crate::constants::{
+    error_code, opcode, pulse_code, MsgType, DEFAULT_HEARTBEAT_TIMEOUT_S,
+    DEFAULT_MAX_PAYLOAD_SIZE, HEADER_SIZE, RELAY_PIN,
+};
+use crate::deadlock::DeadlockGraph;
+use crate::frame::{EacpFrame, EacpHeader};
+
+pub struct RelayConfig {
+    pub max_push_queue: usize,
+    pub max_payload_size: usize,
+    pub heartbeat_timeout_s: f64,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            max_push_queue: 1000,
+            max_payload_size: DEFAULT_MAX_PAYLOAD_SIZE,
+            heartbeat_timeout_s: DEFAULT_HEARTBEAT_TIMEOUT_S,
+        }
+    }
+}
+
+pub struct RelayState {
+    pub config: RelayConfig,
+    /// Maps Agent-PIN -> transmission channel to its active socket task
+    routes: RwLock<HashMap<u64, mpsc::Sender<Bytes>>>,
+    /// Last activity timestamp per Agent-PIN
+    last_seen: RwLock<HashMap<u64, Instant>>,
+    /// QNX Neutrino-style rendezvous deadlock graph
+    deadlock: Mutex<DeadlockGraph>,
+    /// Offline push buffers: target_pin -> [(enqueued_at, timeout_ms, raw_frame_bytes)]
+    push_queues: Mutex<HashMap<u64, VecDeque<(Instant, u32, Bytes)>>>,
+}
+
+impl RelayState {
+    pub fn new(config: RelayConfig) -> Self {
+        Self {
+            config,
+            routes: RwLock::new(HashMap::new()),
+            last_seen: RwLock::new(HashMap::new()),
+            deadlock: Mutex::new(DeadlockGraph::new()),
+            push_queues: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn register_agent(
+        &self,
+        pin: u64,
+        sender: mpsc::Sender<Bytes>,
+    ) {
+        {
+            let mut routes = self.routes.write().await;
+            routes.insert(pin, sender.clone());
+        }
+        {
+            let mut ls = self.last_seen.write().await;
+            ls.insert(pin, Instant::now());
+        }
+        info!(pin = format!("0x{:016X}", pin), "Agent registered");
+
+        // Drain offline push queue for this agent respecting TTL
+        let queued_frames = {
+            let mut queues = self.push_queues.lock().await;
+            queues.remove(&pin)
+        };
+
+        if let Some(mut queue) = queued_frames {
+            let now = Instant::now();
+            while let Some((enqueued_at, timeout_ms, raw_bytes)) = queue.pop_front() {
+                let elapsed = now.duration_since(enqueued_at);
+                if elapsed > Duration::from_millis(timeout_ms as u64) {
+                    // Frame expired while target was offline
+                    continue;
+                }
+                let _ = sender.send(raw_bytes).await;
+            }
+        }
+    }
+
+    pub async fn unregister_agent(&self, pin: u64) {
+        {
+            let mut routes = self.routes.write().await;
+            routes.remove(&pin);
+        }
+        {
+            let mut ls = self.last_seen.write().await;
+            ls.remove(&pin);
+        }
+        {
+            let mut dl = self.deadlock.lock().await;
+            dl.remove_agent(pin);
+        }
+        info!(pin = format!("0x{:016X}", pin), "Agent unregistered");
+    }
+
+    pub async fn update_last_seen(&self, pin: u64) {
+        let mut ls = self.last_seen.write().await;
+        ls.insert(pin, Instant::now());
+    }
+
+    pub async fn prune_timed_out_agents(&self) {
+        let now = Instant::now();
+        let timeout = Duration::from_secs_f64(self.config.heartbeat_timeout_s);
+        let mut timed_out = Vec::new();
+
+        {
+            let ls = self.last_seen.read().await;
+            for (&pin, &last) in ls.iter() {
+                if now.duration_since(last) > timeout {
+                    timed_out.push(pin);
+                }
+            }
+        }
+
+        for pin in timed_out {
+            warn!(pin = format!("0x{:016X}", pin), "Agent heartbeat timed out, removing dead route");
+            self.unregister_agent(pin).await;
+        }
+    }
+}
+
+/// Runs connection handler for an established client stream.
+pub async fn handle_connection<S>(
+    stream: S,
+    state: Arc<RelayState>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (tx, mut rx) = mpsc::channel::<Bytes>(256);
+
+    // Writer task: forward outgoing frames from channel to socket
+    let writer_task = tokio::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if let Err(e) = writer.write_all(&bytes).await {
+                debug!("Failed to write frame to socket: {}", e);
+                break;
+            }
+            if let Err(e) = writer.flush().await {
+                debug!("Failed to flush socket: {}", e);
+                break;
+            }
+        }
+    });
+
+    let mut registered_pin: Option<u64> = None;
+    let mut header_buf = [0u8; HEADER_SIZE];
+
+    loop {
+        // Read 48-byte header
+        if let Err(_) = reader.read_exact(&mut header_buf).await {
+            break;
+        }
+
+        let header = match EacpHeader::from_bytes(&header_buf) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Invalid header magic or structure: error code {}", e);
+                break;
+            }
+        };
+
+        if header.payload_len as usize > state.config.max_payload_size {
+            warn!(
+                "Payload size {} exceeds limit {}",
+                header.payload_len, state.config.max_payload_size
+            );
+            break;
+        }
+
+        // Read payload
+        let mut payload_buf = vec![0u8; header.payload_len as usize];
+        if header.payload_len > 0 {
+            if let Err(e) = reader.read_exact(&mut payload_buf).await {
+                warn!("Failed to read frame payload: {}", e);
+                break;
+            }
+        }
+
+        let frame = EacpFrame::new(header, Bytes::from(payload_buf));
+
+        // 1. Check for registration control frame
+        if frame.header.msg_type == MsgType::MsgRelayControl as u8
+            && frame.header.opcode == opcode::OP_RELAY_REGISTER
+        {
+            let pin = frame.header.sender_pin;
+            registered_pin = Some(pin);
+            state.register_agent(pin, tx.clone()).await;
+
+            // Send registration ACK reply
+            let ack = frame.create_reply(
+                error_code::EACP_SUCCESS,
+                Some(&serde_json::json!({
+                    "registered": true,
+                    "pin": pin
+                })),
+            );
+            let _ = tx.send(ack.to_bytes()).await;
+            continue;
+        }
+
+        if let Some(pin) = registered_pin {
+            state.update_last_seen(pin).await;
+        }
+
+        // 2. Pulse handling
+        if frame.header.is_pulse() {
+            if let Some((code, _)) = frame.get_pulse_data() {
+                if code == pulse_code::PULSE_HEARTBEAT
+                    && (frame.header.target_pin == 0 || frame.header.target_pin == RELAY_PIN)
+                {
+                    // Relay presence ping
+                    continue;
+                }
+                if code == pulse_code::PULSE_CANCEL {
+                    let mut dl = state.deadlock.lock().await;
+                    dl.remove_dependency(frame.header.sender_pin);
+                }
+            }
+        }
+
+        // 3. Rendezvous & Deadlock cycle detection
+        if frame.header.msg_type == MsgType::MsgSend as u8 {
+            let mut dl = state.deadlock.lock().await;
+            if !dl.add_dependency(frame.header.sender_pin, frame.header.target_pin) {
+                // Deadlock detected! Reply immediately with error
+                warn!(
+                    sender = format!("0x{:016X}", frame.header.sender_pin),
+                    target = format!("0x{:016X}", frame.header.target_pin),
+                    "Deadlock detected on MsgSend rendezvous, rejecting"
+                );
+                let err_reply = frame.create_reply(error_code::EACP_ERR_DEADLOCK_DETECTED, None);
+                let _ = tx.send(err_reply.to_bytes()).await;
+                continue;
+            }
+        } else if frame.header.msg_type == MsgType::MsgReply as u8 {
+            let mut dl = state.deadlock.lock().await;
+            dl.remove_dependency(frame.header.target_pin);
+        }
+
+        // 4. Route frame to target
+        let target_pin = frame.header.target_pin;
+        let target_tx = {
+            let routes = state.routes.read().await;
+            routes.get(&target_pin).cloned()
+        };
+
+        let raw_frame_bytes = frame.to_bytes();
+
+        if let Some(target_chan) = target_tx {
+            if let Err(_) = target_chan.send(raw_frame_bytes).await {
+                // Target channel closed, unregister
+                state.unregister_agent(target_pin).await;
+            }
+        } else {
+            // Target is offline
+            if frame.header.is_urgent() {
+                if frame.header.msg_type == MsgType::MsgSend as u8 {
+                    let mut dl = state.deadlock.lock().await;
+                    dl.remove_dependency(frame.header.sender_pin);
+                    let err_reply = frame.create_reply(error_code::EACP_ERR_UNKNOWN_PIN, None);
+                    let _ = tx.send(err_reply.to_bytes()).await;
+                }
+            } else {
+                // Buffer in push queue
+                let timeout_ms = frame.get_timeout_ms();
+                let mut queues = state.push_queues.lock().await;
+                let queue = queues.entry(target_pin).or_insert_with(VecDeque::new);
+                if queue.len() >= state.config.max_push_queue {
+                    queue.pop_front();
+                }
+                queue.push_back((Instant::now(), timeout_ms, raw_frame_bytes));
+            }
+        }
+    }
+
+    if let Some(pin) = registered_pin {
+        state.unregister_agent(pin).await;
+    }
+    writer_task.abort();
+}
