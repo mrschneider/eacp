@@ -168,10 +168,12 @@ EACP strictly enforces capability boundaries at the protocol decoding layer befo
 
 ### 5.2 Verification Invariant
 When an agent receives an EACP frame demanding action $A$, the dispatcher calculates:
-$$\text{Granted} = \text{Frame}.\text{CapabilitiesMask} \ \& \ \text{Manifest}.\text{AllowedCapabilities}$$
-$$\text{Required} = \text{ToolRegistry}[A].\text{RequiredCapabilities}$$
+```
+Granted = Frame.CapabilitiesMask & Manifest.AllowedCapabilities
+Required = ToolRegistry[A].RequiredCapabilities
 
-$$\text{If } (\text{Granted} \ \& \ \text{Required}) \neq \text{Required} \implies \text{EACP\_ERR\_CAPABILITY\_DENIED}$$
+If (Granted & Required) != Required => EACP_ERR_CAPABILITY_DENIED
+```
 
 The rejection occurs immediately in the L2 runtime. The underlying LLM is never invoked, completely mitigating prompt-injection-driven privilege escalation.
 
