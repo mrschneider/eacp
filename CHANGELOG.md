@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-23
+
+### Added
+- **Native Rust Relay Daemon (`crates/eacp-relay`)**:
+  - High-performance, multi-core non-blocking microkernel relay built with Tokio.
+  - Zero-copy framing for 48-byte headers and 4-slot payloads with zero GC jitter.
+  - Native QNX-style circular deadlock cycle detection graph in Rust (`deadlock.rs`).
+  - Standalone 2.2 MB release binary (< 15 MB RAM footprint under heavy concurrency).
+  - Cross-language integration test `tests/test_rust_relay.py` validating Python agent rendezvous over the Rust daemon.
+- **Tactical & Military Resiliency Layer**:
+  - **OMG DDS / C4I Quality of Service (`qos.py`)**: Requested vs Offered (RxO) contract compatibility checks, exclusive ownership arbitration with automatic heartbeat liveliness failover (`OwnershipArbitrator`), and deadline violation monitoring (`DeadlineMonitor`).
+  - **RFC 9171 / DARPA DTN Bundle Protocol Custody Transfer (`dtn.py`)**: Store-and-forward custody transfer (`CustodyStore`), duplicate suppression rings, hop limit guards, and storage capacity limits across partitioned edge links.
+- **Test Suite Expansion**:
+  - Suite expanded to 56 unit and end-to-end integration tests.
+  - CI updated with native Rust compilation and cargo test job.
+
 ## [1.1.0] - 2026-10-23
 
 ### Added

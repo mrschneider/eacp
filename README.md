@@ -102,14 +102,15 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
     ├── test_scheduler.py    # ActiveScheduler & cleanup stack tests
     ├── test_relay.py        # End-to-end multi-agent IPC rendezvous tests
     ├── test_enterprise.py   # Enterprise pillars: encryption, tracing, PKI, mesh, audit
-    └── test_tactical.py     # Tactical resiliency: DDS QoS arbitration & DTN custody transfer
+    ├── test_tactical.py     # Tactical resiliency: DDS QoS arbitration & DTN custody transfer
+    └── test_rust_relay.py   # Python agent <-> Native Rust Relay E2E rendezvous & deadlock test
 ```
 
 ---
 
 ## Quickstart
 
-Run test suite (54 tests):
+Run test suite (56 tests):
 ```bash
 python3 -m unittest discover tests -v
 ```
