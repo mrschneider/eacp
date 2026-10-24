@@ -1,0 +1,501 @@
+{
+  "meta": {
+    "protocol": "EACP",
+    "protocol_version": 1,
+    "header_size": 48,
+    "byte_order": "big-endian (network order)",
+    "header_struct": ">2sBBHHQQQQII",
+    "slot_layout": "payload = len(s0):u16 | s0 | len(s1):u32 | s1 | len(s2):u32 | s2 | len(s3):u32 | s3  (s0=utf8 verb, s1=json invocation, s2=9-byte token_budget:u32/timeout_ms:u32/max_depth_hops:u8, s3=4-byte session_handle:u32 + 64-byte Ed25519 signature)",
+    "signing_domain": "Ed25519 signature covers the 48-byte header (with FLAG_SIGNED set and payload_len = len(slots 0..2) + 64) followed by slots 0..2 and the 4-byte session_handle prefix of slot 3 (signature bytes excluded). See frame.get_signed_bytes().",
+    "compression": "If FLAG_COMPRESSED is set, the payload section is a zlib stream of the slot block described above (zlib level 6 in the reference implementation; decompression is level-agnostic).",
+    "limits": {
+      "max_payload_size_for_negative_vectors": 4096
+    },
+    "note": "A conforming implementation MUST: (a) parse each positive 'frame_hex' into exactly the listed fields; (b) re-encode its own frames to the same bytes; (c) verify Ed25519 signatures over the documented signing domain; (d) reject every negative vector with the listed error."
+  },
+  "identity": {
+    "pin_derivation": {
+      "algorithm": "Agent-PIN = first 8 bytes of SHA-256(public_key) as big-endian uint64",
+      "vectors": [
+        {
+          "private_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+          "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+          "pin_dec": 6217037485330089804,
+          "pin_hex": "0x5647_5AA7_5463_474C"
+        },
+        {
+          "private_seed_hex": "0b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4",
+          "public_key_hex": "d785b49583ee736c66cf55dc87474f4f337c971bfc3d69cba1e21e67763653af",
+          "pin_dec": 14555449184569520428,
+          "pin_hex": "0xC9FF_57EA_5083_F12C"
+        }
+      ]
+    }
+  },
+  "frames_positive": [
+    {
+      "name": "msg_send_minimal",
+      "frame_hex": "eacf0101000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d0000000000000000000000090000000400000000000013880a00000000",
+      "expected": {
+        "version": 1,
+        "msg_type": 1,
+        "msg_type_name": "MSG_SEND",
+        "opcode": 0,
+        "flags": 0,
+        "sender_pin": 0,
+        "target_pin": 0,
+        "transaction_id": 0,
+        "capabilities_mask": 0,
+        "status": 0,
+        "verb": "",
+        "data": null,
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      }
+    },
+    {
+      "name": "msg_send_full_signed",
+      "frame_hex": "eacf01010100000956475aa75463474cc9ff57ea5083f12ca1b2c3d4e5f60718000000000000000a00000000000000a50000000e0000003a000000090000004471756572795f64617461626173657b227175657279223a2253454c4543542070696e2c20766572622046524f4d206167656e7473204c494d49542032222c226c696d6974223a327d0000080000000bb8050000002a56350b8f960e26e4a78d95f46d1f2f9dec8ca77e7d01924e7ac049d7a9d3f79ea93274fec33a461b717783c44bc90921ddf824e815a4678bfa1afc355c50b607",
+      "expected": {
+        "version": 1,
+        "msg_type": 1,
+        "msg_type_name": "MSG_SEND",
+        "opcode": 256,
+        "flags": 9,
+        "sender_pin": 6217037485330089804,
+        "target_pin": 14555449184569520428,
+        "transaction_id": 11651590505119483672,
+        "capabilities_mask": 10,
+        "status": 0,
+        "verb": "query_database",
+        "data": {
+          "query": "SELECT pin, verb FROM agents LIMIT 2",
+          "limit": 2
+        },
+        "constraints": {
+          "token_budget": 2048,
+          "timeout_ms": 3000,
+          "max_depth_hops": 5
+        },
+        "session_handle": 42
+      },
+      "signature_hex": "56350b8f960e26e4a78d95f46d1f2f9dec8ca77e7d01924e7ac049d7a9d3f79ea93274fec33a461b717783c44bc90921ddf824e815a4678bfa1afc355c50b607",
+      "signer_public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+    },
+    {
+      "name": "msg_reply_remaining_budget",
+      "frame_hex": "eacf010301000008c9ff57ea5083f12c56475aa75463474ca1b2c3d4e5f60718000000000000000a00000000000000980000000e0000002d000000090000004471756572795f64617461626173657b22726f7773223a5b5b223078414243222c2270696e67225d5d2c22726f77735f6166666563746564223a317d000006d500000bb8050000002ac877064854eb03862096f00f02d35ecf4fc42fe1a093bc25481f9f472d7081ebab8204bc1ba07d82b761e105f81b6e763ed4fb0d1c196578c2ab5f8f9082b501",
+      "expected": {
+        "version": 1,
+        "msg_type": 3,
+        "msg_type_name": "MSG_REPLY",
+        "opcode": 256,
+        "flags": 8,
+        "sender_pin": 14555449184569520428,
+        "target_pin": 6217037485330089804,
+        "transaction_id": 11651590505119483672,
+        "capabilities_mask": 10,
+        "status": 0,
+        "verb": "query_database",
+        "data": {
+          "rows": [
+            [
+              "0xABC",
+              "ping"
+            ]
+          ],
+          "rows_affected": 1
+        },
+        "constraints": {
+          "token_budget": 1749,
+          "timeout_ms": 3000,
+          "max_depth_hops": 5
+        },
+        "session_handle": 42
+      },
+      "signature_hex": "c877064854eb03862096f00f02d35ecf4fc42fe1a093bc25481f9f472d7081ebab8204bc1ba07d82b761e105f81b6e763ed4fb0d1c196578c2ab5f8f9082b501",
+      "signer_public_key_hex": "d785b49583ee736c66cf55dc87474f4f337c971bfc3d69cba1e21e67763653af"
+    },
+    {
+      "name": "msg_pulse_cancel",
+      "frame_hex": "eacf010400000000c9ff57ea5083f12c56475aa75463474c00000000000000070000000000000000000000000000000800020000deadbeef",
+      "expected": {
+        "version": 1,
+        "msg_type": 4,
+        "msg_type_name": "MSG_PULSE",
+        "opcode": 0,
+        "flags": 0,
+        "sender_pin": 14555449184569520428,
+        "target_pin": 6217037485330089804,
+        "transaction_id": 7,
+        "capabilities_mask": 0,
+        "status": 0,
+        "verb": "",
+        "data": null,
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      }
+    },
+    {
+      "name": "relay_register",
+      "frame_hex": "eacf010500010000c9ff57ea5083f12c00000000000000000000000000000001000000000000000200000000000000750000000800000050000000090000000472656769737465727b227075625f6279746573223a2264373835623439353833656537333663363663663535646338373437346634663333376339373162666333643639636261316532316536373736333635336166227d00000000000013880a00000000",
+      "expected": {
+        "version": 1,
+        "msg_type": 5,
+        "msg_type_name": "MSG_RELAY_CONTROL",
+        "opcode": 1,
+        "flags": 0,
+        "sender_pin": 14555449184569520428,
+        "target_pin": 0,
+        "transaction_id": 1,
+        "capabilities_mask": 2,
+        "status": 0,
+        "verb": "register",
+        "data": {
+          "pub_bytes": "d785b49583ee736c66cf55dc87474f4f337c971bfc3d69cba1e21e67763653af"
+        },
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      }
+    },
+    {
+      "name": "msg_send_compressed",
+      "frame_hex": "eacf01010000000456475aa75463474cc9ff57ea5083f12c0000000000000002000000000000000000000000000001c5789cedd2bd8a54411884e10e4c148c042fe0c41574f5ffb79977602e22228381b20b3a8120e65eb66fef3d9875c1ccc05073e69ca73aa5f43aa5b7ef534a2f79bdf8fef9c7d7dba72f4f8ff7dbaffbef6bbf5f0fd7bb93939393939393939393939393939393939393ff9e4bd7fde9dbedf1e7f5f021cb2aaa6aea1a9a5a0a992f2d17b9ca4deef290a7bce450c92afca6a85495a6d25586ca54592aa19a55adca25ab6a53edaa4375aa2ed550cb6a562b6afc6353eb6a436daa2db550cfea562fea559d1beaea437daa2ff5d0c81ad6281a55a36970bf43636a2c8dd0cc9ad62c9a55b369764d1e676a2ecdd0ca5ad62a5a55ab6975ada1c5d32ead506485154551154dd115433115606c0d38321e19908c488624639241c9a8645832bd67367a1b6ecb6dba6db7f1b6dee6c3cf00ba6c5f7a181a44a368188da381349286d258baee21e8c1693c0da81135a4c6d4a01a55c3eab617a387aca135b606d7e81a5ee36b808db0fb9e961ec846d9301b67036da40db5b136d81efb0cd0c3db801b71436ecc0dba5137ecc6dd731f167ad01b7b836ff40dbff137039805cc045efb54d163053383d9c10c61963053982dcc18660dc73e7ef1f14f7ace9bbfaff6c73f5803895d",
+      "expected": {
+        "version": 1,
+        "msg_type": 1,
+        "msg_type_name": "MSG_SEND",
+        "opcode": 0,
+        "flags": 4,
+        "sender_pin": 6217037485330089804,
+        "target_pin": 14555449184569520428,
+        "transaction_id": 2,
+        "capabilities_mask": 0,
+        "status": 0,
+        "verb": "large_context",
+        "data": {
+          "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "tokens": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79,
+            80,
+            81,
+            82,
+            83,
+            84,
+            85,
+            86,
+            87,
+            88,
+            89,
+            90,
+            91,
+            92,
+            93,
+            94,
+            95,
+            96,
+            97,
+            98,
+            99,
+            100,
+            101,
+            102,
+            103,
+            104,
+            105,
+            106,
+            107,
+            108,
+            109,
+            110,
+            111,
+            112,
+            113,
+            114,
+            115,
+            116,
+            117,
+            118,
+            119,
+            120,
+            121,
+            122,
+            123,
+            124,
+            125,
+            126,
+            127,
+            128,
+            129,
+            130,
+            131,
+            132,
+            133,
+            134,
+            135,
+            136,
+            137,
+            138,
+            139,
+            140,
+            141,
+            142,
+            143,
+            144,
+            145,
+            146,
+            147,
+            148,
+            149,
+            150,
+            151,
+            152,
+            153,
+            154,
+            155,
+            156,
+            157,
+            158,
+            159,
+            160,
+            161,
+            162,
+            163,
+            164,
+            165,
+            166,
+            167,
+            168,
+            169,
+            170,
+            171,
+            172,
+            173,
+            174,
+            175,
+            176,
+            177,
+            178,
+            179,
+            180,
+            181,
+            182,
+            183,
+            184,
+            185,
+            186,
+            187,
+            188,
+            189,
+            190,
+            191,
+            192,
+            193,
+            194,
+            195,
+            196,
+            197,
+            198,
+            199
+          ]
+        },
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      },
+      "expect_flag_compressed": true
+    },
+    {
+      "name": "msg_reply_capability_denied",
+      "frame_hex": "eacf010300000000c9ff57ea5083f12c56475aa75463474ca1b2c3d4e5f607180000000000000000000000030000004d0000000b0000002500000009000000047265626f6f745f6e6f64657b226572726f72223a22506c6174536563206361706162696c6974792064656e696564227d00000000000013880a00000000",
+      "expected": {
+        "version": 1,
+        "msg_type": 3,
+        "msg_type_name": "MSG_REPLY",
+        "opcode": 0,
+        "flags": 0,
+        "sender_pin": 14555449184569520428,
+        "target_pin": 6217037485330089804,
+        "transaction_id": 11651590505119483672,
+        "capabilities_mask": 0,
+        "status": 3,
+        "verb": "reboot_node",
+        "data": {
+          "error": "PlatSec capability denied"
+        },
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      }
+    }
+  ],
+  "signatures": {
+    "algorithm": "Ed25519 (RFC 8032), pure \u2014 no prehash",
+    "signing_bytes_of_msg_send_full_signed": "eacf01010100000956475aa75463474cc9ff57ea5083f12ca1b2c3d4e5f60718000000000000000a00000000000000a571756572795f64617461626173657b227175657279223a2253454c4543542070696e2c20766572622046524f4d206167656e7473204c494d49542032222c226c696d6974223a327d0000080000000bb8050000002a",
+    "verify_positive": {
+      "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "signature_hex": "56350b8f960e26e4a78d95f46d1f2f9dec8ca77e7d01924e7ac049d7a9d3f79ea93274fec33a461b717783c44bc90921ddf824e815a4678bfa1afc355c50b607",
+      "signing_bytes_hex": "eacf01010100000956475aa75463474cc9ff57ea5083f12ca1b2c3d4e5f60718000000000000000a00000000000000a571756572795f64617461626173657b227175657279223a2253454c4543542070696e2c20766572622046524f4d206167656e7473204c494d49542032222c226c696d6974223a327d0000080000000bb8050000002a",
+      "expect_valid": true
+    },
+    "verify_negative_tampered_payload": {
+      "note": "same frame with verb changed; signature MUST be invalid",
+      "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "signature_hex": "56350b8f960e26e4a78d95f46d1f2f9dec8ca77e7d01924e7ac049d7a9d3f79ea93274fec33a461b717783c44bc90921ddf824e815a4678bfa1afc355c50b607",
+      "mutate": {
+        "field": "verb",
+        "from": "query_database",
+        "to": "query_databaseX"
+      },
+      "expect_valid": false
+    }
+  },
+  "frames_negative": [
+    {
+      "name": "bad_magic",
+      "bytes_hex": "000001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "error": "invalid_magic"
+    },
+    {
+      "name": "unsupported_version",
+      "bytes_hex": "eacf63010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "error": "malformed_frame"
+    },
+    {
+      "name": "unknown_msg_type",
+      "bytes_hex": "eacf017f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "error": "malformed_frame"
+    },
+    {
+      "name": "truncated_header",
+      "bytes_hex": "eacf010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "error": "malformed_frame"
+    },
+    {
+      "name": "truncated_payload",
+      "bytes_hex": "eacf0101000000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000000000000000000",
+      "error": "malformed_frame"
+    },
+    {
+      "name": "payload_exceeds_max",
+      "bytes_hex": "eacf01010000000000000000000000000000000000000000000000000000000000000000000000000000000000001001",
+      "error": "payload_too_large",
+      "max_payload_size": 4096
+    },
+    {
+      "name": "garbage_slot_lengths",
+      "bytes_hex": "eacf010100000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000ffff000000000000000000000000",
+      "error": "malformed_frame"
+    },
+    {
+      "name": "invalid_utf8_verb",
+      "bytes_hex": "eacf0101000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e0002fffe000000000000000000000000",
+      "error": "malformed_frame"
+    },
+    {
+      "name": "bad_zlib_stream",
+      "bytes_hex": "eacf010100000004000000000000000000000000000000000000000000000000000000000000000000000000000000080000000000000000",
+      "error": "malformed_frame"
+    }
+  ],
+  "compression_check": {
+    "note": "payload section (after 48-byte header) of msg_send_compressed is a raw zlib stream; any zlib implementation must decompress it"
+  }
+}

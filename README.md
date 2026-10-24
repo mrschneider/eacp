@@ -69,6 +69,11 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 ├── ARCHITECTURE.md          # Canonical Protocol Reference
 ├── README.md                # Quickstart & Overview
 ├── pyproject.toml           # Python packaging
+├── conformance/             # Cross-language wire-format contract (vectors + verifier)
+│   ├── CONFORMANCE.md       # How to implement EACP in any language
+│   ├── generate.py          # Deterministic vector generator
+│   ├── verify.py            # Independent strict consumer / self-check
+│   └── vectors.json         # Byte-exact ground truth
 ├── src/
 │   └── eacp/
 │       ├── __init__.py      # Package export
@@ -147,3 +152,4 @@ asyncio.run(main())
 - **No zombie routes:** offline push queues respect per-message TTL; heartbeat timeouts prune dead transports.
 - **Deterministic rollback:** `CleanupStack` guarantees resource recovery when `RunL()` leaves.
 - **Non-repudiation:** every routed frame produces a hash-chained audit ledger entry.
+- **Language-portable by construction:** the wire contract is pinned by the `conformance/` suite — byte-exact vectors that any Scala/Rust/Go implementation must satisfy to join the mesh (and that CI enforces on every push).

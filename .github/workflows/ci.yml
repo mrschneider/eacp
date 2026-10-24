@@ -36,6 +36,11 @@ jobs:
       - name: Run test suite
         run: python -m unittest discover tests -v
 
+      - name: Cross-language conformance vectors
+        run: |
+          python conformance/generate.py
+          python conformance/verify.py
+
       - name: Smoke test relay CLI
         run: python -m eacp.relay --help
 

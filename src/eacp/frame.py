@@ -143,14 +143,26 @@ class EacpFrame:
     @classmethod
     def unpack_slots(cls, payload: bytes) -> Tuple[str, Any, ExecutionConstraints, CryptoEnvelope]:
         if len(payload) < 16:
-            return "", None, ExecutionConstraints(), CryptoEnvelope()
+            raise ValueError(f"Slot length block too short: {len(payload)} < 16")
 
         l0, l1, l2, l3 = struct.unpack(">IIII", payload[:16])
         offset = 16
-        
+
+        # Strict bounds check: declared slot lengths must fit the payload exactly.
+        # Silent tolerance here would let malformed frames parse with truncated
+        # slots — a conformance and interop hazard.
+        total = l0 + l1 + l2 + l3
+        if offset + total > len(payload):
+            raise ValueError(
+                f"Slot lengths exceed payload: need {offset + total}, have {len(payload)}"
+            )
+
         slot0_bytes = payload[offset : offset + l0]
         offset += l0
-        verb = slot0_bytes.decode("utf-8", errors="replace")
+        try:
+            verb = slot0_bytes.decode("utf-8")  # strict: invalid UTF-8 is a protocol error
+        except UnicodeDecodeError as e:
+            raise ValueError(f"Verb slot is not valid UTF-8: {e}") from e
 
         slot1_bytes = payload[offset : offset + l1]
         offset += l1
@@ -239,6 +251,8 @@ class EacpFrame:
         
         if magic != EACP_MAGIC:
             raise ValueError(f"Invalid EACP magic: {magic!r} != {EACP_MAGIC!r}")
+        if ver != EACP_VERSION:
+            raise ValueError(f"Unsupported EACP version: {ver} != {EACP_VERSION}")
 
         if payload_len > max_payload_size:
             raise ValueError(f"Payload length {payload_len} exceeds max allowed {max_payload_size}")
