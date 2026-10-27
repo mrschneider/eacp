@@ -15,3 +15,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 sha2 = "0.10"
+
+# Native relay ships from CI on every tag: thin LTO crosses the
+# frame/relay/deadlock crate boundary; codegen-units=1 keeps the
+# inliner working on the per-frame path.
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -92,6 +92,16 @@ class EacpFrame:
     envelope: CryptoEnvelope = field(default_factory=CryptoEnvelope)
     raw_payload: Optional[bytes] = None
 
+    def __setattr__(self, name: str, value: object) -> None:
+        """Post-construction mutation of any field invalidates the parsed
+        wire cache (raw_payload): verification must still SEE tampering
+        (test_frame_signing_and_verification re-encodes mutated fields),
+        while the unmodified relay verify path keeps the zero-re-encode
+        fast path in get_signed_bytes."""
+        if name != "raw_payload" and self.__dict__.get("raw_payload") is not None:
+            object.__setattr__(self, "raw_payload", None)
+        object.__setattr__(self, name, value)
+
     def is_pulse(self) -> bool:
         return self.msg_type == MsgType.MSG_PULSE
 
@@ -188,6 +198,37 @@ class EacpFrame:
         Header (48 bytes) with payload length matching slots[0..2] + slots 0..2.
         Slot 3 signature is excluded from the signature calculation.
         """
+        # Fast path: a parsed frame already carries the exact wire slots
+        # (raw_payload = the decompressed slot block). Slicing them costs
+        # nothing and cannot drift from the bytes the peer signed — a
+        # json re-encode here was pure per-frame waste on the verify path
+        # (relay route_frame -> verify_frame, once per signed message).
+        if not self.is_pulse() and self.raw_payload is not None and len(self.raw_payload) >= 16:
+            l0, l1, l2, l3 = struct.unpack(">IIII", self.raw_payload[:16])
+            if 16 + l0 + l1 + l2 + l3 == len(self.raw_payload):
+                slots_012 = self.raw_payload[16 : 16 + l0 + l1 + l2]
+                s3_head = self.raw_payload[16 + l0 + l1 + l2 : 20 + l0 + l1 + l2]
+                if len(s3_head) == 4:
+                    # Contract locked by the conformance vectors: the signed
+                    # bytes are header + slots WITHOUT the 16-byte length
+                    # block; the block only feeds the header's payload_len.
+                    flags = int(self.flags) | int(FrameFlags.FLAG_SIGNED)
+                    lens = struct.pack(">IIII", l0, l1, l2, 4)
+                    payload_len_field = len(lens) + len(slots_012) + len(s3_head) + 64
+                    hdr = HEADER_STRUCT.pack(
+                        self.magic,
+                        self.version,
+                        int(self.msg_type),
+                        self.opcode,
+                        flags,
+                        self.sender_pin,
+                        self.target_pin,
+                        self.transaction_id,
+                        self.capabilities_mask,
+                        int(self.status),
+                        payload_len_field,
+                    )
+                    return hdr + slots_012 + s3_head
         slot0 = self.verb.encode("utf-8") if self.verb else b""
         if self.data is None:
             slot1 = b""
