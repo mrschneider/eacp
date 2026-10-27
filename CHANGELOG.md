@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-10-26
+
+### Changed
+- **Verify path: zero re-encode per signed frame** - `EacpFrame.get_signed_bytes()`
+  derives the signed subset by slicing `raw_payload` on parsed frames instead of
+  re-serializing slots with JSON on every relay verification. The signed content
+  keeps the conformance-locked shape (header + slots WITHOUT the 16-byte length
+  block; the block only feeds the header `payload_len`).
+- **Tamper detection preserved** - any post-construction field mutation clears the
+  parsed-wire cache via `__setattr__`, so mutated frames fall back to re-encoding
+  and are rejected (unit test + negative conformance vector stay correct;
+  fast path == contract byte-for-byte at 79 bytes).
+- **DTN duplicate-suppression ring** evicts with `deque.popleft()` (O(1)) instead
+  of `list.pop(0)`, which shifted up to 5001 entries per bundle past capacity.
+- **Native relay release profile** - `[profile.release]` with thin LTO and
+  `codegen-units = 1` for the standalone `crates/eacp-relay` crate (release
+  build ~15.9s; binary smoke-tested).
+
 ## [1.2.0] - 2026-10-23
 
 ### Added
