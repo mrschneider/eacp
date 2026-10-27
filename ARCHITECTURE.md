@@ -297,3 +297,48 @@ To ensure uninterrupted coordination across partitioned, contested, or intermitt
 * **Custody Transfer Handover (`CustodyStore`):** Uses RFC 9171 store-and-forward semantics with atomic custody transfer (`CUSTODY_ACCEPTED`). An upstream agent retains message custody until downstream explicitly acknowledges custody responsibility.
 * **Resiliency Controls:** Bounded buffer memory accounting, duplicate suppression rings, hop limit guards against routing cycles, and proactive TTL expiration pruning prevent message loss and memory starvation across severed WAN/edge mesh topologies.
 
+## Appendix — Directory map
+
+Full per-file map of the repository (kept here so the README stays lean):
+
+```
+.
+├── ARCHITECTURE.md          # Canonical Protocol Reference
+├── README.md                # Quickstart & Overview
+├── pyproject.toml           # Python packaging
+├── conformance/             # Cross-language wire-format contract (vectors + verifier)
+│   ├── CONFORMANCE.md       # How to implement EACP in any language
+│   ├── generate.py          # Deterministic vector generator
+│   ├── verify.py            # Independent strict consumer / self-check
+│   └── vectors.json         # Byte-exact ground truth
+├── crates/
+│   └── eacp-relay/          # High-performance native Rust microkernel relay daemon
+│       ├── Cargo.toml
+│       └── src/             # Tokio async event loop, zero-copy wire parser, deadlock engine
+├── src/
+│   └── eacp/
+│       ├── __init__.py      # Package export
+│       ├── __main__.py      # `python3 -m eacp` CLI entry point
+│       ├── constants.py     # OpCodes, MsgTypes, Capabilities & Error codes
+│       ├── frame.py         # 48-byte binary header & slot serializer
+│       ├── security.py      # Ed25519 identity, PlatSec gates, Enterprise CA, AES-GCM
+│       ├── scheduler.py     # ActiveScheduler, CActive, CleanupStack, AsyncActive
+│       ├── primitives.py    # QNX rendezvous primitives (MsgSend, MsgReceive, MsgReply, MsgPulse)
+│       ├── relay.py         # Push relay daemon, deadlock graph, heartbeat reaper, CLI
+│       ├── client.py        # Agent RSessionBase client wrapper
+│       ├── telemetry.py     # W3C TraceContext + Prometheus metrics
+│       ├── ledger.py        # Immutable append-only audit ledger
+│       ├── mesh.py          # Multi-relay HA peer mesh routing
+│       ├── budget.py        # Token budget escrow/settle/refund ledger
+│       ├── qos.py           # DDS C4I QoS policies, RxO compatibility & ownership failover
+│       └── dtn.py           # RFC 9171 DTN store-and-forward custody transfer
+└── tests/
+    ├── test_frame.py        # Binary wire serialization tests
+    ├── test_security.py     # PlatSec & capability verification tests
+    ├── test_scheduler.py    # ActiveScheduler & cleanup stack tests
+    ├── test_relay.py        # End-to-end multi-agent IPC rendezvous tests
+    ├── test_budget.py       # Token budget escrow/settlement invariant tests
+    ├── test_enterprise.py   # Enterprise pillars: encryption, tracing, PKI, mesh, audit
+    ├── test_tactical.py     # Tactical resiliency: DDS QoS arbitration & DTN custody transfer
+    └── test_rust_relay.py   # Python agent <-> Native Rust Relay E2E rendezvous & deadlock test
+```

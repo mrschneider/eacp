@@ -5,46 +5,79 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Code Style](https://img.shields.io/badge/wire%20format-48%20byte%20binary-orange)
 
-**EACP** is a microkernel-grade communication and coordination protocol for enterprise multi-agent systems. It fuses deterministic cooperative concurrency and capability-based security (PlatSec) with synchronous rendezvous IPC (QNX Neutrino) and cryptographic PIN-routed push delivery.
-
----
-
-## What is EACP and how does it work?
-
-EACP replaces the fragile "agents calling each other over HTTP/JSON" pattern with a battle-tested operating-system discipline: agents do not talk to each other directly — they talk to a **kernel-like relay** through synchronous, permission-checked rendezvous.
+**EACP** is a microkernel-grade communication and coordination protocol for
+enterprise multi-agent systems: deterministic cooperative concurrency and
+capability-based security (PlatSec), synchronous rendezvous IPC (QNX Neutrino
+discipline), and cryptographic PIN-routed push delivery.
 
 ![EACP Architecture — how agents communicate](docs/eacp-architecture.png)
 
-The lifecycle of a single call:
+## How one call flows
 
-1. **`MsgSend`** — Agent A (caller) sends a synchronous request addressed to Agent B's cryptographic **Agent-PIN** (a 64-bit identity derived from its Ed25519 public key — never an IP or DNS name, so agents are migratable across cloud/edge without breaking addressing). The caller blocks (rendezvous) until replied.
-2. **Route by PIN** — the **EACP-Relay** looks up the target in its PIN routing table, verifies the frame's Ed25519 signature in transit, and runs deadlock cycle detection (`A→B→C→A` is rejected before it can hang the mesh). Offline targets get their frames queued with TTL.
-3. **Permission check (PlatSec)** — before Agent B runs anything, the 64-bit capability bitmask on the frame is validated against B's signed security manifest. Insufficient capability → **denied**, and no LLM inference or tool is ever invoked — this is what makes prompt-injection privilege escalation structurally impossible.
-4. **Run handler** — the handler executes under B's cooperative `ActiveScheduler`, with its token budget escrowed upfront (over-budget work is refused before spending compute) and a hop guard against infinite delegation.
-5. **`MsgReply`** — the result travels back and unblocks the caller; the reply carries the *remaining* token budget so the delegation tree shares one envelope. Every frame is recorded in a hash-chained audit ledger.
+1. **`MsgSend`** — Agent A addresses Agent B's cryptographic **Agent-PIN**
+   (64 bits derived from its Ed25519 key — never an IP or DNS name, so agents
+   migrate across cloud/edge without breaking addressing) and blocks on
+   rendezvous until replied.
+2. **Route by PIN** — the **EACP-Relay** resolves the PIN, verifies the
+   frame's Ed25519 signature in transit, and rejects deadlock cycles
+   (`A→B→C→A`) before they can hang the mesh. Offline targets get TTL'd
+   queues.
+3. **Permission check (PlatSec)** — the frame's 64-bit capability bitmask is
+   validated against Agent B's signed manifest *before* anything runs:
+   insufficient capability means **denied**, with no LLM inference or tool
+   ever invoked — prompt-injection privilege escalation becomes structurally
+   impossible.
+4. **Run handler** — execution happens under B's cooperative
+   `ActiveScheduler` with the token budget escrowed upfront (over-budget work
+   is refused before spending compute) and a hop guard against infinite
+   delegation.
+5. **`MsgReply`** — the result unblocks the caller and carries the
+   *remaining* token budget, so the delegation tree shares one envelope.
+   Every frame lands in a hash-chained audit ledger.
 
-**Pulses** (heartbeat + cancel) are 8-byte out-of-band signals flowing outside the rendezvous: they keep routes alive across flaky edge links and cancel in-flight reasoning steps without blocking.
+**Pulses** (heartbeat + cancel) are 8-byte out-of-band signals flowing
+outside the rendezvous: they keep routes alive across flaky edge links and
+cancel in-flight reasoning steps without blocking.
 
 ### The message format
 
-Every message is a fixed **48-byte binary header** (magic, version, message type, opcode, flags, sender/target PIN, transaction ID, capability mask, status) followed by four structured slots: **Verb**, **Arguments**, **Constraints** (token budget, timeout, hop limit) and a cryptographic **Envelope** (Ed25519 signature + session handle). Binary, not JSON — deterministic, compact, and verifiable.
+A fixed **48-byte binary header** (magic, version, message type, opcode,
+flags, sender/target PIN, transaction ID, capability mask, status) followed
+by four structured slots: **Verb**, **Arguments**, **Constraints** (token
+budget, timeout, hop limit) and a cryptographic **Envelope** (Ed25519
+signature + session handle). Binary, not JSON — deterministic, compact,
+verifiable.
 
-### Enterprise capabilities baked in
+## Key pillars
 
-CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryption · W3C trace context propagation · peer relay routing (multi-cloud/edge HA) · TTL queues + heartbeats · Prometheus metrics · tamper-evident audit ledger. See the hardening table below for module-by-module details.
+1. **Deterministic concurrency (Active Objects)** — one single-threaded
+   cooperative event loop per agent: no thread sprawl, no races, no
+   uncontrolled token usage.
+2. **Platform Security (PlatSec)** — a 64-bit capability bitmask validated
+   at the protocol frame layer before any action or tool executes.
+3. **Synchronous rendezvous (QNX Neutrino IPC)** — `MsgSend` /
+   `MsgReceive` / `MsgReply` with built-in deadlock cycle detection.
+4. **Agent-PIN cryptographic addressing** — global 64-bit addressing
+   independent of IP/DNS, routed across cloud and edge by the EACP-Relay.
 
----
+## Design guarantees
 
-## Key Pillars
+- **Prompt injection cannot escalate privileges** — PlatSec validation
+  happens at the L2 protocol layer, before any LLM inference or tool
+  invocation.
+- **Circular deadlocks are impossible** — the relay's `DeadlockGraph`
+  rejects `MsgSend` cycles with `EACP_ERR_DEADLOCK_DETECTED`.
+- **No zombie routes** — offline push queues respect per-message TTL;
+  heartbeat timeouts prune dead transports.
+- **Deterministic rollback** — `CleanupStack` guarantees resource recovery
+  when `RunL()` leaves.
+- **Non-repudiation** — every routed frame produces a hash-chained audit
+  ledger entry.
+- **Language-portable by construction** — the wire contract is pinned by
+  `conformance/`: byte-exact vectors any Scala/Rust/Go implementation must
+  satisfy to join the mesh, enforced by CI on every push.
 
-1. **Deterministic Concurrency (Active Objects):** Single-thread cooperative event loop per agent eliminating thread sprawl, race conditions, and uncontrolled token usage.
-2. **Platform Security (PlatSec):** 64-bit capability bitmask validated at the protocol frame layer before any action or tool executes.
-3. **Synchronous Rendezvous (QNX Neutrino IPC):** `MsgSend` / `MsgReceive` / `MsgReply` protocol lifecycle with built-in deadlock cycle detection.
-4. **Agent-PIN Cryptographic Addressing:** Global 64-bit cryptographic addressing independent of IP/DNS, routed transparently across cloud and edge topologies via the EACP-Relay.
-
----
-
-## Enterprise-Grade Hardening (v1.0)
+## Enterprise hardening
 
 | Capability | Module | Description |
 |---|---|---|
@@ -62,83 +95,38 @@ CA-signed agent registration · TLS/mTLS transport · AES-256-GCM payload encryp
 | DDS C4I QoS Contract | `qos.py` | Requested vs Offered (RxO) contract validation + exclusive ownership arbitration with failover |
 | DTN Store-and-Forward | `dtn.py` | RFC 9171 / DARPA Bundle Protocol custody transfer, duplicate suppression & hop limits |
 
----
-
-## Directory Layout
-
-```
-.
-├── ARCHITECTURE.md          # Canonical Protocol Reference
-├── README.md                # Quickstart & Overview
-├── pyproject.toml           # Python packaging
-├── conformance/             # Cross-language wire-format contract (vectors + verifier)
-│   ├── CONFORMANCE.md       # How to implement EACP in any language
-│   ├── generate.py          # Deterministic vector generator
-│   ├── verify.py            # Independent strict consumer / self-check
-│   └── vectors.json         # Byte-exact ground truth
-├── crates/
-│   └── eacp-relay/          # High-performance native Rust microkernel relay daemon
-│       ├── Cargo.toml
-│       └── src/             # Tokio async event loop, zero-copy wire parser, deadlock engine
-├── src/
-│   └── eacp/
-│       ├── __init__.py      # Package export
-│       ├── constants.py     # OpCodes, MsgTypes, Capabilities & Error codes
-│       ├── frame.py         # 48-byte binary header & slot serializer
-│       ├── security.py      # Ed25519 identity, PlatSec gates, Enterprise CA, AES-GCM
-│       ├── scheduler.py     # ActiveScheduler, CActive, CleanupStack, AsyncActive
-│       ├── primitives.py    # QNX rendezvous primitives (MsgSend, MsgReceive, MsgReply, MsgPulse)
-│       ├── relay.py         # Push relay daemon, deadlock graph, heartbeat reaper, CLI
-│       ├── client.py        # Agent RSessionBase client wrapper
-│       ├── telemetry.py     # W3C TraceContext + Prometheus metrics
-│       ├── ledger.py        # Immutable append-only audit ledger
-│       ├── mesh.py          # Multi-relay HA peer mesh routing
-│       ├── qos.py           # DDS C4I QoS policies, RxO compatibility & ownership failover
-│       ├── dtn.py           # RFC 9171 DTN store-and-forward custody transfer
-│       └── __main__.py      # `python3 -m eacp` CLI entry point
-└── tests/
-    ├── test_frame.py        # Binary wire serialization tests
-    ├── test_security.py     # PlatSec & capability verification tests
-    ├── test_scheduler.py    # ActiveScheduler & cleanup stack tests
-    ├── test_relay.py        # End-to-end multi-agent IPC rendezvous tests
-    ├── test_enterprise.py   # Enterprise pillars: encryption, tracing, PKI, mesh, audit
-    ├── test_tactical.py     # Tactical resiliency: DDS QoS arbitration & DTN custody transfer
-    └── test_rust_relay.py   # Python agent <-> Native Rust Relay E2E rendezvous & deadlock test
-```
-
----
-
 ## Quickstart
 
-Run test suite (56 tests):
+Run the test suite (56 tests):
+
 ```bash
 python3 -m unittest discover tests -v
 ```
 
 Run the EACP-Relay daemon:
+
 ```bash
-# High-performance native Rust Relay (sub-millisecond deterministic latency, zero GC)
+# native Rust relay (deterministic, zero GC)
 cargo run --release --manifest-path crates/eacp-relay/Cargo.toml -- --port 8990
 
-# Or portable pure-Python Relay
+# or the portable pure-Python relay
 python3 -m eacp.relay --host 0.0.0.0 --port 8990
 ```
 
 Minimal agent example:
+
 ```python
 import asyncio
 from eacp import RSessionBase, MsgSend, Capability
 
 async def main():
-    relay_port = 8990
-
     server = RSessionBase(allowed_capabilities=Capability.CAP_DISK_READ)
     server.register_handler("query", lambda f: {"result": 42},
                             required_caps=Capability.CAP_DISK_READ)
-    await server.connect(port=relay_port)
+    await server.connect(port=8990)
 
     client = RSessionBase(allowed_capabilities=Capability.CAP_DISK_READ)
-    await client.connect(port=relay_port)
+    await client.connect(port=8990)
 
     reply = await MsgSend(client, target_pin=server.pin, verb="query",
                           data={"sql": "SELECT 1"})
@@ -150,13 +138,29 @@ async def main():
 asyncio.run(main())
 ```
 
----
+## Layout
 
-## Design Guarantees
+```
+ARCHITECTURE.md     canonical protocol reference (wire format, PlatSec, scheduler, relay)
+conformance/        cross-language wire contract: vectors + generator + strict verifier
+crates/eacp-relay/  native Rust relay daemon (tokio, zero-copy parser, deadlock engine)
+src/eacp/           protocol core: frame · security · scheduler · primitives · relay ·
+                    client · telemetry · ledger · mesh · budget · qos · dtn
+tests/              8 suites: frame · security · scheduler · relay · budget ·
+                    enterprise · tactical · rust_relay
+docs/               architecture diagram
+```
 
-- **Prompt injection cannot escalate privileges:** PlatSec validation happens at the L2 protocol layer, before any LLM inference or tool invocation.
-- **Circular deadlocks are impossible:** the relay's `DeadlockGraph` rejects `MsgSend` cycles (`A→B→C→A`) with `EACP_ERR_DEADLOCK_DETECTED`.
-- **No zombie routes:** offline push queues respect per-message TTL; heartbeat timeouts prune dead transports.
-- **Deterministic rollback:** `CleanupStack` guarantees resource recovery when `RunL()` leaves.
-- **Non-repudiation:** every routed frame produces a hash-chained audit ledger entry.
-- **Language-portable by construction:** the wire contract is pinned by the `conformance/` suite — byte-exact vectors that any Scala/Rust/Go implementation must satisfy to join the mesh (and that CI enforces on every push).
+Per-file map: [ARCHITECTURE.md — Appendix](ARCHITECTURE.md#appendix--directory-map).
+
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — canonical protocol reference
+  (wire format, PlatSec, scheduler, rendezvous semantics, relay, error codes)
+- [conformance/CONFORMANCE.md](conformance/CONFORMANCE.md) — how to
+  implement EACP in any language
+- [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
+
+## License
+
+MIT.
