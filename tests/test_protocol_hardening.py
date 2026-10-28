@@ -956,7 +956,13 @@ class TestPerTargetQueueOverflow(HardenedRelayTestBase):
                     constraints=ExecutionConstraints(timeout_ms=10_000),
                 )
                 caller.identity.sign_frame(fr)
-                await asyncio.to_thread(caller.writer.write, fr.pack())
+                # StreamWriter.write is NOT thread-safe: on the Windows
+                # proactor a call_soon from a foreign thread does not wake
+                # the loop, the frames sit unflushed until the reply timer
+                # fires, and the QUEUE_FULL reply lands after the 5s
+                # timeout (raw socket.sendall in a thread is fine; this is
+                # a StreamWriter). Write on the loop thread.
+                caller.writer.write(fr.pack())
                 await caller.writer.drain()
             reply = await asyncio.wait_for(fut, timeout=5)
             self.assertEqual(reply.status, EacpError.EACP_ERR_QUEUE_FULL,
