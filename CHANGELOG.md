@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server certificate unless `verify_server=False` is passed explicitly.
 
 ### Added
+- **Benchmark harness** — `bench/relay_bench.py` measures Python vs Rust
+  relays on identical signed wire workloads: RTT p50/p95/p99, sequential and
+  pipelined throughput, RSS per registered connection, and stalled-consumer
+  isolation + recovery (fresh relay per scenario). First calibration run and
+  honest reading notes (including the observed Rust pipelined regression and
+  the Ed25519 verification asymmetry) in `docs/benchmarks.md`.
 - **Request registry with real cancellation** — in-flight handlers are tracked
   per (sender, tx); caller timeouts emit `PULSE_CANCEL` that actually cancels
   the handler coroutine, refunds the escrow and answers best-effort; disconnect

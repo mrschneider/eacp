@@ -167,6 +167,9 @@ Per-file map: [ARCHITECTURE.md — Appendix](ARCHITECTURE.md#appendix--directory
   (wire format, PlatSec, scheduler, rendezvous semantics, relay, error codes)
 - [conformance/CONFORMANCE.md](conformance/CONFORMANCE.md) — how to
   implement EACP in any language
+- [docs/benchmarks.md](docs/benchmarks.md) — relay benchmarks (RTT
+  p50/p95/p99, throughput, memory/conn, stalled-consumer recovery;
+  Python vs Rust, methodology and honest gaps)
 - [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md)
 
 ## License
