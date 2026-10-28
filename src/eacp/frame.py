@@ -202,9 +202,17 @@ class EacpFrame:
 
     def get_signed_bytes(self) -> bytes:
         """
-        Returns bytes used for Ed25519 signing/verifying:
-        Header (48 bytes) with payload length matching slots[0..2] + slots 0..2.
-        Slot 3 signature is excluded from the signature calculation.
+        Returns bytes used for Ed25519 signing/verifying (signing contract
+        v2, wire version 2 — SEC-02):
+
+            header(48) || slot_length_block(16) || verb || arguments ||
+            constraints || envelope_prefix(4)
+
+        The 16-byte length block IS authenticated: without it, repartitioning
+        the same concatenated bytes across slot boundaries (verb/arguments
+        swap) would change the parsed frame while preserving the signature.
+        Slot 3's 64-byte signature itself is excluded (it cannot sign itself);
+        only its 4-byte session handle prefix is covered.
         """
         # Fast path: a parsed frame already carries the exact wire slots
         # (raw_payload = the decompressed slot block). Slicing them costs
@@ -217,14 +225,16 @@ class EacpFrame:
                 slots_012 = self.raw_payload[16 : 16 + l0 + l1 + l2]
                 s3_head = self.raw_payload[16 + l0 + l1 + l2 : 20 + l0 + l1 + l2]
                 if len(s3_head) == 4:
-                    # Contract locked by the conformance vectors: the signed
-                    # bytes are header + slots WITHOUT the 16-byte length
-                    # block; the block only feeds the header's payload_len.
-                    # FLAG_COMPRESSED is a TRANSPORT encoding bit decided by
-                    # pack() AFTER signing — it is excluded from the
-                    # authenticated header so compression can never invalidate
-                    # a legitimate signature (and the decompression bound in
-                    # unpack() keeps the excluded bit from becoming a bomb).
+                    # Signing contract v2 (SEC-02): header + the 16-byte
+                    # slot length block + slots. The length block closes the
+                    # boundary-repartition hole (same concatenated bytes,
+                    # different verb/args split -> different signature
+                    # input). FLAG_COMPRESSED is a TRANSPORT encoding bit
+                    # decided by pack() AFTER signing — it is excluded from
+                    # the authenticated header so compression can never
+                    # invalidate a legitimate signature (and the
+                    # decompression bound in unpack() keeps the excluded bit
+                    # from becoming a bomb).
                     flags = (int(self.flags) & ~int(FrameFlags.FLAG_COMPRESSED)) | int(FrameFlags.FLAG_SIGNED)
                     lens = struct.pack(">IIII", l0, l1, l2, 4)
                     payload_len_field = len(lens) + len(slots_012) + len(s3_head) + 64
@@ -241,7 +251,7 @@ class EacpFrame:
                         int(self.status),
                         payload_len_field,
                     )
-                    return hdr + slots_012 + s3_head
+                    return hdr + self.raw_payload[:16] + slots_012 + s3_head
         slot0 = self.verb.encode("utf-8") if self.verb else b""
         if self.data is None:
             slot1 = b""
@@ -260,7 +270,10 @@ class EacpFrame:
         
         # Calculate total payload for slots 0..2 + envelope prefix (session handle)
         slot3_prefix = struct.pack(">I", self.envelope.session_handle if self.envelope else 0)
-        lens = struct.pack(">IIII", len(slot0), len(slot1), len(slot2), len(slot3_prefix))
+        # slot 3 on the FINAL wire carries handle + signature (4+64): the
+        # length block must predict exactly what pack() will emit, or the
+        # fast path (parsed frames) and this path would sign different bytes
+        lens = struct.pack(">IIII", len(slot0), len(slot1), len(slot2), len(slot3_prefix) + 64)
         payload_subset = lens + slot0 + slot1 + slot2 + slot3_prefix
 
         # Use full signed payload length in header
@@ -278,7 +291,9 @@ class EacpFrame:
             int(self.status),
             total_len,
         )
-        return hdr + slot0 + slot1 + slot2 + slot3_prefix
+        # signing contract v2 (SEC-02): the length block is part of the
+        # authenticated input — see get_signed_bytes docstring
+        return hdr + lens + slot0 + slot1 + slot2 + slot3_prefix
 
     def pack(self) -> bytes:
         # Fast path: forward the exact wire bytes we were parsed from. This
@@ -360,13 +375,27 @@ class EacpFrame:
             try:
                 obj = zlib.decompressobj()
                 effective_payload = obj.decompress(payload, decomp_limit + 1)
+                # REL-01: reject BEFORE any unbounded flush. A limited
+                # decompress() leaves the rest of the stream in
+                # unconsumed_tail; obj.flush() would expand it without a
+                # limit, letting a small bomb allocate megabytes before the
+                # post-hoc length check fired.
+                if len(effective_payload) > decomp_limit or obj.unconsumed_tail:
+                    raise ValueError(
+                        f"Decompressed payload exceeds limit {decomp_limit} "
+                        f"(rejected before expansion)"
+                    )
                 effective_payload += obj.flush()
             except zlib.error as e:
                 raise ValueError(f"Malformed compressed payload: {e}") from e
-            if len(effective_payload) > decomp_limit or obj.unconsumed_tail:
+            if len(effective_payload) > decomp_limit:
                 raise ValueError(
                     f"Decompressed payload {len(effective_payload)} exceeds limit {decomp_limit}"
                 )
+            if not obj.eof:
+                raise ValueError("Truncated compressed payload (incomplete stream)")
+            if obj.unused_data:
+                raise ValueError("Trailing bytes after the compressed stream (concatenated streams are rejected)")
 
         verb, data, constraints, envelope = cls.unpack_slots(effective_payload)
         return cls(

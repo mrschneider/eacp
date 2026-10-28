@@ -24,15 +24,31 @@ Given `vectors.json`:
    decompress it. (The reference encoder uses zlib level 6, but decoders must
    not assume a level.)
 
-4. **Signatures** (`signatures`) — Ed25519 (RFC 8032, pure). The signed bytes
-   are the 48-byte header (FLAG_SIGNED set, payload length = slots 0..2 + 64)
-   followed by slots 0..2 and the 4-byte session-handle prefix of slot 3.
-   Verify the positive vector; verify that the tampered vector FAILS.
+4. **Signatures** (`signatures`) — Ed25519 (RFC 8032, pure), signing
+   contract **v2** (wire version 2). The signed bytes are the 48-byte
+   header (FLAG_SIGNED set, FLAG_COMPRESSED excluded, payload length =
+   16 + slots 0..2 + 68) followed by the **16-byte slot length block**,
+   slots 0..2, and the 4-byte session-handle prefix of slot 3. The length
+   block is authenticated: repartitioning the same concatenated bytes
+   across slot boundaries (verb/arguments swap) changes the signature
+   input, and `verify.py` checks exactly that case. Verify the positive
+   vector; verify that BOTH the tampered and the repartitioned vectors
+   FAIL.
 
 5. **Negative vectors** (`frames_negative[*]`) — each byte string MUST be
    rejected. Accepting any of them is a conformance failure (they encode
    real hazards: version confusion, out-of-bounds slot lengths, invalid
    UTF-8 verbs, zlib bombs).
+
+## Versioning & compatibility
+
+The wire `version` byte is `0x02` (EACP v2). v2 authenticates the slot
+length block (signing contract v2); v1 peers sign a different byte set and
+are refused **at the version check** by both implementations — never by a
+misleading signature error. Compatibility policy: additive error codes or
+new relay-control opcodes stay within the same wire version (semver minor);
+any change to the signed byte set or the header layout bumps the wire
+version (semver major). There is no dual acceptance of v1 signatures.
 
 ## Layout
 

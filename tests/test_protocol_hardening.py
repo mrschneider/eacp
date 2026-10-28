@@ -10,6 +10,7 @@ mesh request/reply, origin binding, trace propagation, TLS defaults.
 
 import asyncio
 import json
+import struct
 import sys
 import time
 import unittest
@@ -18,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from eacp.constants import Capability, EacpError, FrameFlags, MsgType, OpCode
+from eacp.constants import Capability, EACP_VERSION, EacpError, FrameFlags, MsgType, OpCode
 from eacp.frame import EacpFrame, ExecutionConstraints, HEADER_STRUCT
 from eacp.ledger import AuditLedger, LedgerIntegrityError
 from eacp.mesh import RelayPeer
@@ -88,6 +89,35 @@ class TestSigningCompressionContract(unittest.TestCase):
         self.assertTrue(verifier.verify_frame(parsed), "signature must survive compression")
         self.assertEqual(parsed.data, frame.data)
 
+    def test_slot_repartition_rejected(self):
+        # SEC-02: same concatenated bytes, different verb/args boundary —
+        # the 16-byte length block is authenticated (signing contract v2)
+        ident = AgentIdentity.generate()
+        frame = EacpFrame(
+            msg_type=MsgType.MSG_SEND, verb="read", sender_pin=ident.pin,
+            target_pin=7, transaction_id=5,
+            data={"a": "admin"},  # json starts with '{"a"' -> repartition target
+        )
+        ident.sign_frame(frame)
+        wire = frame.pack()
+        l0, l1, l2, l3 = struct.unpack(">IIII", wire[48:64])
+        self.assertGreaterEqual(l1, 5)
+        shift = 5
+        new_lens = struct.pack(">IIII", l0 + shift, l1 - shift, l2, l3)
+        repartitioned = wire[:48] + new_lens + wire[64:]
+
+        from eacp.security import AgentVerifier
+
+        original = EacpFrame.unpack(wire)
+        forged = EacpFrame.unpack(repartitioned)
+        self.assertNotEqual(original.verb, forged.verb, "repartition must change the parsed verb")
+        self.assertEqual(original.raw_payload[16:], forged.raw_payload[16:],
+                         "content bytes unchanged — only the boundary moved")
+        verifier = AgentVerifier.from_public_bytes(ident.public_bytes)
+        self.assertTrue(verifier.verify_frame(original))
+        self.assertFalse(verifier.verify_frame(forged),
+                         "repartitioned frame must fail: lengths are authenticated")
+
     def test_compression_bit_tamper_still_caught(self):
         # excluding the encoding bit must not excuse real tampering
         ident = AgentIdentity.generate()
@@ -120,12 +150,58 @@ class TestDecompressionBound(unittest.TestCase):
         compressed = zlib.compress(raw, 9)
         self.assertLess(len(compressed), 1_048_576)  # wire fits the 16MB cap
         buffer = HEADER_STRUCT.pack(
-            b"\xEA\xCF", 1, int(MsgType.MSG_SEND), 0x0100,
+            b"\xEA\xCF", EACP_VERSION, int(MsgType.MSG_SEND), 0x0100,
             int(FrameFlags.FLAG_COMPRESSED), 1, 2, 3, 0, 0, len(compressed),
         ) + compressed
         with self.assertRaises(ValueError) as ctx:
             EacpFrame.unpack(buffer, max_payload_size=1_048_576)
         self.assertIn("exceeds limit", str(ctx.exception))
+
+    def test_bomb_allocation_stays_near_limit(self):
+        # REL-01: the 7.7 MB peak vs a 64 KiB limit — bounded decompression
+        # must reject WITHOUT expanding the remaining stream (flush-before-
+        # check would expand everything first)
+        import tracemalloc
+        import zlib as _zlib
+
+        raw = struct_lens_with_zeros(8 * 1024 * 1024)
+        compressed = _zlib.compress(raw, 9)
+        buffer = HEADER_STRUCT.pack(
+            b"\xEA\xCF", EACP_VERSION, int(MsgType.MSG_SEND), 0x0100,
+            int(FrameFlags.FLAG_COMPRESSED), 1, 2, 3, 0, 0, len(compressed),
+        ) + compressed
+        tracemalloc.start()
+        try:
+            with self.assertRaises(ValueError):
+                EacpFrame.unpack(buffer, max_payload_size=4096)  # 64 KiB decomp limit
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        limit = 64 * 1024
+        self.assertLess(
+            peak, limit + 1024 * 1024,
+            f"peak traced allocation {peak} B vs limit {limit} B — decompression must stop near the limit",
+        )
+
+    def test_truncated_and_trailing_streams_rejected(self):
+        import zlib as _zlib
+
+        raw = struct_lens_with_zeros(4096)
+        compressed = _zlib.compress(raw, 6)
+        base = HEADER_STRUCT.pack(
+            b"\xEA\xCF", EACP_VERSION, int(MsgType.MSG_SEND), 0x0100,
+            int(FrameFlags.FLAG_COMPRESSED), 1, 2, 3, 0, 0, 0,
+        )
+        # truncated stream (cut mid-stream)
+        truncated = base[:44] + (len(compressed) - 10).to_bytes(4, "big") + compressed[:-10]
+        with self.assertRaises(ValueError) as ctx:
+            EacpFrame.unpack(truncated)
+        self.assertIn("Truncated", str(ctx.exception))
+        # trailing bytes after a complete stream (concatenated) -> reject
+        trailing = base[:44] + (len(compressed) * 2).to_bytes(4, "big") + compressed + compressed
+        with self.assertRaises(ValueError) as ctx:
+            EacpFrame.unpack(trailing)
+        self.assertIn("Trailing", str(ctx.exception))
 
     def test_legit_tight_wire_config_still_verifies(self):
         # a legitimately compressed frame whose DECOMPRESSED size exceeds a
@@ -133,7 +209,7 @@ class TestDecompressionBound(unittest.TestCase):
         raw = struct_lens_with_zeros(5000)
         compressed = zlib.compress(raw, 6)
         buffer = HEADER_STRUCT.pack(
-            b"\xEA\xCF", 1, int(MsgType.MSG_SEND), 0x0100,
+            b"\xEA\xCF", EACP_VERSION, int(MsgType.MSG_SEND), 0x0100,
             int(FrameFlags.FLAG_COMPRESSED), 1, 2, 3, 0, 0, len(compressed),
         ) + compressed
         frame = EacpFrame.unpack(buffer, max_payload_size=4096)
@@ -663,6 +739,39 @@ class TestLedgerRecovery(unittest.TestCase):
                                 capabilities_mask=0, status=0)
             self.assertEqual(more.prev_hash, again.entries[2].entry_hash, "chain continues")
             again.close()
+
+    def test_rotation_preserves_absolute_indices(self):
+        # REL-02: segment ending at N -> restart -> append must NOT restart
+        # the index at len(recovered); chain verification accepts rotated
+        # segments and multiple restarts stay monotonic
+        import tempfile, os
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "audit.log")
+            led = AuditLedger(file_path=path, fsync_every=1, rotate_bytes=750)
+            first = [
+                led.record(tx_id=i, sender_pin=1, target_pin=2, verb="v",
+                           capabilities_mask=0, status=0).index
+                for i in range(5)
+            ]
+            led.close()
+            self.assertEqual(first, [0, 1, 2, 3, 4])
+            self.assertTrue(os.path.exists(path + ".1"), "rotation must have rolled a segment")
+
+            again = AuditLedger(file_path=path, fsync_every=1, rotate_bytes=750)
+            self.assertEqual(again.entries[0].index, 3, "base segment starts mid-chain")
+            nxt = again.record(tx_id=99, sender_pin=1, target_pin=2, verb="v",
+                               capabilities_mask=0, status=0).index
+            self.assertEqual(nxt, 5, "append continues the absolute sequence, not len(entries)")
+            self.assertTrue(again.verify_chain())
+            again.close()
+
+            third = AuditLedger(file_path=path, fsync_every=1, rotate_bytes=750)
+            self.assertTrue(third.verify_chain())
+            indices = [e.index for e in third.entries]
+            self.assertEqual(indices, list(range(indices[0], 6)),
+                             f"monotonic absolute indices expected, got {indices}")
+            third.close()
 
     def test_tampered_file_refuses_to_load(self):
         import tempfile, os

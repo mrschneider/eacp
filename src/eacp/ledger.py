@@ -67,6 +67,10 @@ class AuditLedger:
         self.rotate_bytes = rotate_bytes
         self._entries: List[AuditEntry] = []
         self._last_hash = self.GENESIS_HASH
+        # absolute next index — len(self._entries) is NOT the next index
+        # after recovering a rotated segment (REL-02): a segment starting
+        # at N must continue at N+len, never restart from len
+        self._next_index = 0
         self._fh = None
         self._bytes_written = 0
         self._since_fsync = 0
@@ -127,6 +131,7 @@ class AuditLedger:
             expected_prev = entry.entry_hash
         self._entries = recovered
         self._last_hash = recovered[-1].entry_hash
+        self._next_index = recovered[-1].index + 1
         self._bytes_written = os.path.getsize(self.file_path)
 
     # ---- durable append ----------------------------------------------------
@@ -160,7 +165,8 @@ class AuditLedger:
         data_payload: Optional[bytes | str] = None,
     ) -> AuditEntry:
         """Appends a cryptographically chained audit record."""
-        index = len(self._entries)
+        index = self._next_index
+        self._next_index += 1
         now = time.time()
 
         # Digest payload content (without storing sensitive PII in plain text)
@@ -218,9 +224,17 @@ class AuditLedger:
         Cryptographic verification of the entire ledger chain:
         Validates sequential indices, prev_hash link, and individual entry_hash integrity.
         """
-        expected_prev = self.GENESIS_HASH
-        for idx, entry in enumerate(self._entries):
-            if entry.index != idx:
+        if not self._entries:
+            return True
+        # indices are absolute but the FILE may start mid-chain (rotated
+        # segment): verify continuity from the file's own first index, and
+        # require the genesis anchor only when the segment claims index 0
+        start = self._entries[0].index
+        if start == 0 and self._entries[0].prev_hash != self.GENESIS_HASH:
+            return False
+        expected_prev = self._entries[0].prev_hash
+        for offset, entry in enumerate(self._entries):
+            if entry.index != start + offset:
                 return False
             if entry.prev_hash != expected_prev:
                 return False

@@ -89,7 +89,12 @@ def main() -> None:
     pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(sig["verify_positive"]["public_key_hex"]))
     signing_bytes = bytes.fromhex(sig["verify_positive"]["signing_bytes_hex"])
     signature = bytes.fromhex(sig["verify_positive"]["signature_hex"])
-    frame_f, _ = parsed_by_name["msg_send_full_signed"]
+    frame_f, raw_orig = parsed_by_name["msg_send_full_signed"]
+    # repartition recipe (SEC-02): shift 5 bytes of the boundary from the
+    # arguments slot into the verb slot, content bytes untouched
+    _l0, _l1, _l2, _l3 = struct.unpack(">IIII", raw_orig[48:64])
+    _shift = min(5, _l1)
+    new_lens = struct.pack(">IIII", _l0 + _shift, _l1 - _shift, _l2, _l3)
     check(frame_f.get_signed_bytes() == signing_bytes,
           "reference signing bytes match vectors")
     try:
@@ -110,6 +115,21 @@ def main() -> None:
     except InvalidSignature:
         tampered_valid = False
     check(not tampered_valid, "tampered frame signature rejected")
+
+    # negative: repartition the slot boundaries (SEC-02) — identical
+    # concatenated bytes under a different verb/args split. The 16-byte
+    # length block is authenticated in signing contract v2, so the same
+    # signature must fail against the repartitioned frame.
+    repartitioned = raw_orig[:48] + new_lens + raw_orig[64:]
+    rp = EacpFrame.unpack(repartitioned)
+    check(rp.verb != frame_f.verb,
+          f"repartition changed the parsed verb ({frame_f.verb!r} -> {rp.verb!r})")
+    try:
+        pub.verify(signature, rp.get_signed_bytes())
+        rp_valid = True
+    except InvalidSignature:
+        rp_valid = False
+    check(not rp_valid, "slot repartition rejected (length block authenticated)")
 
     # --------------------------------------------------------------- negative
     print("== negative vectors: must be rejected with the expected class ==")

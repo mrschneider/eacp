@@ -2,7 +2,7 @@
 //! Protocol constants and opcodes for EACP Relay.
 
 pub const EACP_MAGIC: [u8; 2] = [0xEA, 0xCF];
-pub const EACP_VERSION: u8 = 1;
+pub const EACP_VERSION: u8 = 2;
 pub const HEADER_SIZE: usize = 48;
 
 pub const DEFAULT_MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16 MB

@@ -1,6 +1,6 @@
 # EACP (Enterprise Agentic Communication Protocol)
 ## Architectural Specification & Protocol Reference
-**Version:** 1.0.0  
+**Version:** 2.0.0  
 **Status:** Canonical Reference Specification  
 **Authors:** Architecture Team / Infrastructure Operations  
 
@@ -105,7 +105,7 @@ All EACP frames are transmitted in network byte order (big-endian). A frame cons
 
 #### Field Definitions:
 * **Magic (16 bits):** `0xEA, 0xCF`. Validates protocol frame sync.
-* **Version (8 bits):** `0x01` for EACP v1.
+* **Version (8 bits):** `0x02` for EACP v2 (signing contract v2 — the slot length block is authenticated; v1 frames are refused at this check, see CONFORMANCE.md "Versioning & compatibility").
 * **MsgType (8 bits):**
   * `0x01`: `MSG_SEND` (Synchronous request; sender transitions to `REPLY_BLOCKED`)
   * `0x02`: `MSG_RECEIVE` (Worker poll request)
@@ -139,7 +139,7 @@ The payload following the 32-byte header is structured into four explicit slots:
 |   - max_depth_hops: uint8                                               |
 +-------------------------------------------------------------------------+
 | Slot 3: Cryptographic Envelope & Context Metadata                       |
-|   - signature: Ed25519(Header + Slots[0..2])                            |
+|   - signature: Ed25519(Header + LengthBlock + Slots[0..2])              |
 |   - session_handle: uint32                                              |
 +-------------------------------------------------------------------------+
 ```

@@ -28,6 +28,12 @@ impl EacpHeader {
         }
 
         let version = raw[2];
+        // wire version demarcation: v1 peers used the old signing contract
+        // (slot length block not authenticated) — refuse them explicitly
+        // instead of failing signature verification with a mystery error
+        if version != EACP_VERSION {
+            return Err(error_code::EACP_ERR_MALFORMED_FRAME);
+        }
         let msg_type = raw[3];
         let opcode = u16::from_be_bytes([raw[4], raw[5]]);
         let flags = u16::from_be_bytes([raw[6], raw[7]]);

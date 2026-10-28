@@ -7,7 +7,7 @@ from enum import IntEnum, IntFlag
 # 16-bit Protocol Magic: 0xEACF
 EACP_MAGIC = b"\xEA\xCF"
 EACP_MAGIC_INT = 0xEACF
-EACP_VERSION = 1
+EACP_VERSION = 2
 
 # Header fixed length: 48 bytes (64-bit aligned)
 HEADER_SIZE = 48

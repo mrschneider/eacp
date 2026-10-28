@@ -136,7 +136,7 @@ class TestEacpFrame(unittest.TestCase):
         # Frame declaring payload larger than allowed max
         fake_header = HEADER_STRUCT.pack(
             EACP_MAGIC,
-            1,
+            EACP_VERSION,
             int(MsgType.MSG_SEND),
             0,
             0,
