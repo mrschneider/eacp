@@ -424,6 +424,58 @@
         },
         "session_handle": 0
       }
+    },
+    {
+      "name": "msg_reply_replay_detected",
+      "frame_hex": "eacf010300000000c9ff57ea5083f12c56475aa75463474c000000000000000300000000000000000000000c000000530000000e00000028000000090000000471756572795f64617461626173657b226572726f72223a227265706c61796564207472616e73616374696f6e2072656675736564227d00000000000013880a00000000",
+      "expected": {
+        "version": 1,
+        "msg_type": 3,
+        "msg_type_name": "MSG_REPLY",
+        "opcode": 0,
+        "flags": 0,
+        "sender_pin": 14555449184569520428,
+        "target_pin": 6217037485330089804,
+        "transaction_id": 3,
+        "capabilities_mask": 0,
+        "status": 12,
+        "verb": "query_database",
+        "data": {
+          "error": "replayed transaction refused"
+        },
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      }
+    },
+    {
+      "name": "msg_reply_queue_full",
+      "frame_hex": "eacf010300000000c9ff57ea5083f12c56475aa75463474c000000000000000400000000000000000000000d00000056000000100000002900000009000000046f66666c696e655f64656c69766572797b226572726f72223a226f66666c696e6520717565756520627564676574206578636565646564227d00000000000013880a00000000",
+      "expected": {
+        "version": 1,
+        "msg_type": 3,
+        "msg_type_name": "MSG_REPLY",
+        "opcode": 0,
+        "flags": 0,
+        "sender_pin": 14555449184569520428,
+        "target_pin": 6217037485330089804,
+        "transaction_id": 4,
+        "capabilities_mask": 0,
+        "status": 13,
+        "verb": "offline_delivery",
+        "data": {
+          "error": "offline queue budget exceeded"
+        },
+        "constraints": {
+          "token_budget": 0,
+          "timeout_ms": 5000,
+          "max_depth_hops": 10
+        },
+        "session_handle": 0
+      }
     }
   ],
   "signatures": {

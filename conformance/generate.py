@@ -198,6 +198,22 @@ def main() -> None:
         data={"error": "PlatSec capability denied"},
     ))
 
+    # 7b. Additive error statuses (wire-visible codes 12/13)
+    add("msg_reply_replay_detected", EacpFrame(
+        msg_type=MsgType.MSG_REPLY,
+        sender_pin=idb.pin, target_pin=ida.pin, transaction_id=3,
+        status=EacpError.EACP_ERR_REPLAY_DETECTED,
+        verb="query_database",
+        data={"error": "replayed transaction refused"},
+    ))
+    add("msg_reply_queue_full", EacpFrame(
+        msg_type=MsgType.MSG_REPLY,
+        sender_pin=idb.pin, target_pin=ida.pin, transaction_id=4,
+        status=EacpError.EACP_ERR_QUEUE_FULL,
+        verb="offline_delivery",
+        data={"error": "offline queue budget exceeded"},
+    ))
+
     vectors["frames_positive"] = frames
 
     # ------------------------------------------------------------ signatures

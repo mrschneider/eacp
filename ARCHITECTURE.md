@@ -292,6 +292,11 @@ Mesh (§8.1), QoS RxO contracts and DTN are **experimental extensions**: unit-te
 | `6` | `0x0006` | `EACP_ERR_CANCELLED` | Operation cancelled via `MsgPulse` |
 | `7` | `0x0007` | `EACP_ERR_TOKEN_OVERFLOW` | Execution exceeded token budget constraint |
 | `8` | `0x0008` | `EACP_ERR_SIGNATURE_INVALID` | Ed25519 signature verification failure |
+| `9` | `0x0009` | `EACP_ERR_MALFORMED_FRAME` | Frame structure/slot layout invalid |
+| `10` | `0x000A` | `EACP_ERR_DISCONNECTED` | Peer transport closed mid-rendezvous |
+| `11` | `0x000B` | `EACP_ERR_DEPTH_EXCEEDED` | `max_depth_hops` exhausted (delegation limit) |
+| `12` | `0x000C` | `EACP_ERR_REPLAY_DETECTED` | Repeated (sender, tx) refused — replay protection |
+| `13` | `0x000D` | `EACP_ERR_QUEUE_FULL` | Offline queue budget exceeded (explicit refusal) |
 
 ---
 
