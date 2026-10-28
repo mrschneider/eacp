@@ -219,6 +219,8 @@ class EacpRelay:
         self.unix_path: Optional[str] = None
         self._reaper_task: Optional[asyncio.Task[None]] = None
         self._running: bool = False
+        self._active_connections: Set[asyncio.StreamWriter] = set()
+        self._connection_tasks: Set[asyncio.Task] = set()
 
         # Enterprise extensions
         self.metrics: EacpMetrics = EacpMetrics()
@@ -451,6 +453,14 @@ class EacpRelay:
     ) -> None:
         session: Optional[RelayClientSession] = None
         registered_pin: Optional[int] = None
+        current_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            pass
+        if current_task is not None:
+            self._connection_tasks.add(current_task)
+        self._active_connections.add(writer)
         # SEC-03: peer identity lives on the CONNECTION (PSK handshake),
         # never inside a claimed name in a later frame
         peer_state: Dict[str, Optional[str]] = {"authed": None, "pending": None, "nonce": None}
@@ -626,6 +636,9 @@ class EacpRelay:
         except Exception as e:
             logger.error(f"Relay connection handler error: {e}", exc_info=True)
         finally:
+            if current_task is not None:
+                self._connection_tasks.discard(current_task)
+            self._active_connections.discard(writer)
             if registered_pin:
                 self.unregister_agent(registered_pin)
             if session:
@@ -916,21 +929,37 @@ class EacpRelay:
         self._running = False
         if self._reaper_task and not self._reaper_task.done():
             self._reaper_task.cancel()
-        # peers FIRST (see MeshRoutingTable.close_all): an open peer
-        # transport keeps its connection handler alive and wait_closed()
-        # would block forever
+        # 1. Close peers, sessions, and active transports first so no inbound task
+        # is left blocked awaiting bytes — wait_closed() blocks until every
+        # connection handler has returned.
         self.mesh.close_all()
+        for session in list(self.routes.values()):
+            session.close()
+        self.routes.clear()
+        for writer in list(self._active_connections):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._active_connections.clear()
+        for task in list(self._connection_tasks):
+            if not task.done():
+                task.cancel()
+        self._connection_tasks.clear()
+
+        # 2. Close listening server with a bounded wait so a stubborn
+        # transport never hangs the process or test runner indefinitely.
         if self.server:
             self.server.close()
-            await self.server.wait_closed()
+            try:
+                await asyncio.wait_for(self.server.wait_closed(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
         if self.unix_path and os.path.exists(self.unix_path):
             try:
                 os.unlink(self.unix_path)
             except Exception:
                 pass
-        for session in list(self.routes.values()):
-            session.close()
-        self.routes.clear()
         self.push_queues.clear()
         closer = getattr(self.ledger, "close", None)
         if closer is not None:

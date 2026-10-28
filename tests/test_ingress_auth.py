@@ -93,6 +93,7 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
         server = RSessionBase(allowed_capabilities=Capability.CAP_TOOL_EXEC)
         server.register_handler("reboot", lambda f: ran.append(1) or {"ok": True})
         await server.connect(host="127.0.0.1", port=self.port)
+        attacker = None
         try:
             attacker = socket.create_connection(("127.0.0.1", self.port), timeout=5)
             ident = AgentIdentity.generate()
@@ -101,8 +102,9 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status, EacpError.EACP_ERR_SIGNATURE_INVALID)
             await asyncio.sleep(0.3)
             self.assertEqual(ran, [], "handler must never execute from unregistered ingress")
-            attacker.close()
         finally:
+            if attacker:
+                attacker.close()
             await server.close()
 
     async def test_impersonation_on_registered_connection_refused(self):
@@ -110,6 +112,7 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
         server = RSessionBase(allowed_capabilities=Capability.CAP_TOOL_EXEC)
         server.register_handler("reboot", lambda f: ran.append(1) or {"ok": True})
         await server.connect(host="127.0.0.1", port=self.port)
+        attacker = None
         try:
             attacker = socket.create_connection(("127.0.0.1", self.port), timeout=5)
             me = AgentIdentity.generate()
@@ -120,25 +123,28 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status, EacpError.EACP_ERR_SIGNATURE_INVALID)
             await asyncio.sleep(0.3)
             self.assertEqual(ran, [], "impersonated sender must not execute anything")
-            attacker.close()
         finally:
+            if attacker:
+                attacker.close()
             await server.close()
 
     async def test_pin_switch_after_registration_refused(self):
         a = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-        b = AgentIdentity.generate()
-        first = AgentIdentity.generate()
-        await _register(a, first)
-        reg = EacpFrame(
-            msg_type=MsgType.MSG_RELAY_CONTROL, opcode=OpCode.OP_RELAY_REGISTER,
-            sender_pin=b.pin, target_pin=0, transaction_id=2,
-            capabilities_mask=int(Capability.NONE),
-            data={"pub_bytes": b.public_bytes.hex()},
-        )
-        b.sign_frame(reg)
-        await asyncio.to_thread(a.sendall, reg.pack())
-        self.assertEqual(await _raw_status(a), EacpError.EACP_ERR_SIGNATURE_INVALID)
-        a.close()
+        try:
+            b = AgentIdentity.generate()
+            first = AgentIdentity.generate()
+            await _register(a, first)
+            reg = EacpFrame(
+                msg_type=MsgType.MSG_RELAY_CONTROL, opcode=OpCode.OP_RELAY_REGISTER,
+                sender_pin=b.pin, target_pin=0, transaction_id=2,
+                capabilities_mask=int(Capability.NONE),
+                data={"pub_bytes": b.public_bytes.hex()},
+            )
+            b.sign_frame(reg)
+            await asyncio.to_thread(a.sendall, reg.pack())
+            self.assertEqual(await _raw_status(a), EacpError.EACP_ERR_SIGNATURE_INVALID)
+        finally:
+            a.close()
 
     async def test_ca_manifest_without_pop_cannot_execute(self):
         """The reviewer's exact SEC-01 repro: a genuine CA-signed public
@@ -171,6 +177,7 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
         )
         server.register_handler("reboot", lambda f: ran.append(1) or {"ok": True})
         await server.connect(host="127.0.0.1", port=port)
+        attacker = None
         try:
             attacker = socket.create_connection(("127.0.0.1", port), timeout=5)
             frame = EacpFrame(
@@ -185,8 +192,9 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await _raw_status(attacker), EacpError.EACP_ERR_SIGNATURE_INVALID)
             await asyncio.sleep(0.3)
             self.assertEqual(ran, [], "public manifest without PoP must not authorize")
-            attacker.close()
         finally:
+            if attacker:
+                attacker.close()
             await server.close()
             await relay.stop()
 
