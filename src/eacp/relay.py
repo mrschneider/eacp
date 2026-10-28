@@ -20,7 +20,9 @@ Security model (fail-closed, anchored at registration):
 
 from __future__ import annotations
 import asyncio
+import hmac
 import os
+import secrets
 import time
 from collections import deque
 import logging
@@ -42,7 +44,7 @@ from .constants import (
 )
 from .frame import EacpFrame, HEADER_STRUCT
 from .ledger import AuditLedger
-from .mesh import MeshRoutingTable, RelayPeer
+from .mesh import MeshRoutingTable, RelayPeer, peer_tag
 from .security import (
     AgentVerifier,
     EnterpriseCA,
@@ -367,6 +369,19 @@ class EacpRelay:
         except RuntimeError:
             pass
 
+    async def _refuse_now(
+        self, writer: asyncio.StreamWriter, request: EacpFrame, status: EacpError, detail: str
+    ) -> None:
+        """Inline refusal for teardown paths: unlike _refuse (fire-and-
+        forget task), this AWAITS the flush — the caller breaks and closes
+        the connection right after, and a pending task would lose the race."""
+        err = request.create_reply(status=status, result_data={"error": detail})
+        try:
+            writer.write(err.pack())
+            await writer.drain()
+        except Exception:
+            pass
+
     def _validate_registration(self, frame: EacpFrame) -> Tuple[Optional[AgentVerifier], int, Optional[str]]:
         """Registration trust chain. Returns (verifier, grants, error_detail).
 
@@ -430,6 +445,9 @@ class EacpRelay:
     ) -> None:
         session: Optional[RelayClientSession] = None
         registered_pin: Optional[int] = None
+        # SEC-03: peer identity lives on the CONNECTION (PSK handshake),
+        # never inside a claimed name in a later frame
+        peer_state: Dict[str, Optional[str]] = {"authed": None, "pending": None, "nonce": None}
         try:
             while self._running:
                 # Read 48-byte header
@@ -458,6 +476,17 @@ class EacpRelay:
 
                 # Check registration / relay control
                 if frame.msg_type == MsgType.MSG_RELAY_CONTROL and frame.opcode == OpCode.OP_RELAY_REGISTER:
+                    if registered_pin is not None and frame.sender_pin != registered_pin:
+                        # SEC-01: one connection = one authenticated identity;
+                        # no pin switching after registration
+                        self.metrics.platsec_denials.inc(action="ingress_pin_switch")
+                        await self._refuse_now(
+                            writer,
+                            frame,
+                            EacpError.EACP_ERR_SIGNATURE_INVALID,
+                            "connection already authenticated for another PIN",
+                        )
+                        break
                     registered_pin = frame.sender_pin
                     verifier, grants, err_detail = self._validate_registration(frame)
                     if err_detail is not None:
@@ -488,31 +517,87 @@ class EacpRelay:
                     await session.send_frame(ack)
                     continue
 
-                # Mesh route announcements (peer traffic): origin binding —
-                # only a configured peer id may announce, and only for itself
+                # Mesh peer handshake (SEC-03): peer identity is established
+                # on THIS connection via PSK challenge/response, never taken
+                # from a claimed name inside a later frame
+                if (
+                    frame.msg_type == MsgType.MSG_RELAY_CONTROL
+                    and frame.opcode in (OpCode.OP_RELAY_PEER_HELLO, OpCode.OP_RELAY_PEER_AUTH)
+                ):
+                    await self._peer_handshake_step(frame, writer, peer_state)
+                    continue
+
+                # Mesh route announcements: admitted only from a connection
+                # that completed the peer handshake (and, for originated
+                # frames, AS that origin). Forwarded announces ride an
+                # authenticated peer's word that the origin told them so —
+                # within the PSK trust boundary (ARCHITECTURE, mesh section).
                 if frame.msg_type == MsgType.MSG_RELAY_CONTROL and frame.opcode == OpCode.OP_RELAY_ROUTE_ANNOUNCE:
                     data = frame.data if isinstance(frame.data, dict) else {}
                     origin = data.get("origin_peer")
                     pin = data.get("pin")
                     action = data.get("action")
-                    if origin in self.mesh.peers and isinstance(pin, int):
-                        is_originated = not data.get("forwarded")
-                        if is_originated:
+                    authed_as = peer_state["authed"]
+                    forwarded = bool(data.get("forwarded"))
+                    admitted = authed_as is not None and (
+                        origin == authed_as or (forwarded and origin in self.mesh.peers)
+                    )
+                    if not admitted:
+                        self.metrics.platsec_denials.inc(action="announce_unauthed")
+                        logger.warning(
+                            f"Ignoring route announce: connection authenticated as {authed_as!r} "
+                            f"may not announce for {origin!r} (peer handshake required)"
+                        )
+                        continue
+                    if isinstance(pin, int):
+                        if not data.get("forwarded"):
                             if action == "remove":
-                                self.mesh.unregister(pin)
+                                applied = self.mesh.release_remote(pin, authed_as)
                             else:
-                                self.mesh.register_remote(pin, origin)
+                                applied = self.mesh.register_remote(pin, authed_as)
+                            if not applied:
+                                logger.warning(
+                                    f"Announce ownership refused: peer {authed_as!r} may not "
+                                    f"modify the route of {format_pin(pin)}"
+                                )
+                                continue
                             # rebroadcast to the other peers (loop-safe:
-                            # forwarded frames are never rebroadcast again)
+                            # forwarded frames are never forwarded again)
                             await self.mesh.broadcast_route(
-                                pin, action=action or "add", forwarded=True, exclude_peer=origin
+                                pin, action=action or "add", forwarded=True, exclude_peer=authed_as
                             )
                         # duplicates/forwarded frames already applied upstream
-                    else:
-                        logger.warning(
-                            f"Ignoring route announce: origin {origin!r} is not a configured peer (binding refused)"
-                        )
                     continue
+
+                # SEC-01: authenticated ingress — application frames are
+                # refused until THIS connection registers (or completes the
+                # peer handshake), and a registered connection may only send
+                # as its own authenticated PIN. Peer connections forward
+                # remote agents' frames under the PSK trust established
+                # above (their own agents authenticated them at their hop).
+                if registered_pin is None and peer_state["authed"] is None:
+                    self.metrics.platsec_denials.inc(action="ingress_unregistered")
+                    logger.warning("Refusing application frame from an unregistered connection")
+                    await self._refuse_now(
+                        writer,
+                        frame,
+                        EacpError.EACP_ERR_SIGNATURE_INVALID,
+                        "unauthenticated ingress: register before sending application frames",
+                    )
+                    break
+                if registered_pin is not None and frame.sender_pin != registered_pin:
+                    self.metrics.platsec_denials.inc(action="ingress_sender_mismatch")
+                    logger.warning(
+                        f"Sender mismatch: frame claims {format_pin(frame.sender_pin)} "
+                        f"on a connection authenticated as {format_pin(registered_pin)}"
+                    )
+                    await self._refuse_now(
+                        writer,
+                        frame,
+                        EacpError.EACP_ERR_SIGNATURE_INVALID,
+                        "sender identity is not bound to this connection",
+                    )
+                    break
 
                 # Ensure sender session is established
                 if not session and registered_pin:
@@ -544,6 +629,60 @@ class EacpRelay:
                     writer.close()
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # mesh peer handshake (SEC-03)
+
+    async def _peer_handshake_step(
+        self, frame: EacpFrame, writer: asyncio.StreamWriter, peer_state: Dict[str, Optional[str]]
+    ) -> None:
+        """PSK challenge/response bound to THIS connection.
+
+        The responder generates a fresh nonce per HELLO and must see an AUTH
+        tagged with it: a captured exchange cannot authenticate a new
+        connection. The challenge carries the responder's own tag so the
+        initiator verifies the remote knows the PSK too (mutual auth).
+        """
+        data = frame.data if isinstance(frame.data, dict) else {}
+        if frame.opcode == OpCode.OP_RELAY_PEER_HELLO:
+            pid = data.get("peer_id")
+            peer = self.mesh.peers.get(pid) if isinstance(pid, str) else None
+            if peer is None or not peer.psk:
+                logger.warning(f"Peer HELLO for {pid!r} refused: not a configured peer with a PSK")
+                return
+            nonce = secrets.token_hex(16)
+            tag = peer_tag(peer.psk, "challenge", pid, nonce)
+            peer_state["pending"] = pid
+            peer_state["nonce"] = nonce
+            chal = EacpFrame(
+                msg_type=MsgType.MSG_RELAY_CONTROL,
+                opcode=OpCode.OP_RELAY_PEER_CHALLENGE,
+                sender_pin=0,
+                target_pin=0,
+                transaction_id=frame.transaction_id,
+                data={"peer_id": pid, "nonce": nonce, "tag": tag},
+            )
+            writer.write(chal.pack())
+            await writer.drain()
+        elif frame.opcode == OpCode.OP_RELAY_PEER_AUTH:
+            pid = data.get("peer_id")
+            nonce = peer_state.get("nonce")
+            if peer_state.get("pending") is None or pid != peer_state["pending"] or not isinstance(nonce, str):
+                logger.warning("Peer AUTH refused: no matching outstanding challenge")
+                return
+            peer = self.mesh.peers.get(pid) if isinstance(pid, str) else None
+            tag = str(data.get("tag", ""))
+            if peer is None or not peer.psk or not hmac.compare_digest(
+                tag, peer_tag(peer.psk, "auth", pid, nonce)
+            ):
+                logger.warning(f"Peer AUTH for {pid!r} failed PSK verification")
+                peer_state["pending"] = None
+                peer_state["nonce"] = None
+                return
+            peer_state["authed"] = pid
+            peer_state["pending"] = None
+            peer_state["nonce"] = None
+            logger.info(f"Mesh peer authenticated on this connection: {pid}")
 
     # ------------------------------------------------------------------
     # routing

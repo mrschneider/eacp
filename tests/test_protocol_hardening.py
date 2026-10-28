@@ -284,7 +284,16 @@ class TestClaimsBoundedByGrants(HardenedRelayTestBase):
             msg_type=MsgType.MSG_SEND, verb="t", sender_pin=ident.pin, target_pin=2,
             transaction_id=1, data={"_caller_manifest": sm.to_dict()},
         )
+        # SEC-01 PoP: valid manifest but UNSIGNED frame -> no grants
+        self.assertEqual(client._caller_grants(frame), 0)
+        # frame signed by the manifest key -> grants count
+        ident.sign_frame(frame)
         self.assertEqual(client._caller_grants(frame), int(Capability.CAP_NET_RAW))
+        frame = EacpFrame(
+            msg_type=MsgType.MSG_SEND, verb="t", sender_pin=ident.pin, target_pin=2,
+            transaction_id=2, data={"_caller_manifest": sm.to_dict()},
+        )
+        ident.sign_frame(frame)
         # wrong CA in the manifest -> 0 (fail closed, not wildcard)
         other = EnterpriseCA()
         sm_bad = other.sign_manifest(
@@ -572,8 +581,8 @@ class TestMeshEndToEnd(unittest.IsolatedAsyncioTestCase):
         await r2.start(host="127.0.0.1", port=0)
         p1 = r1.server.sockets[0].getsockname()[1]
         p2 = r2.server.sockets[0].getsockname()[1]
-        peer12 = RelayPeer("relay-2", "127.0.0.1", p2)
-        peer21 = RelayPeer("relay-1", "127.0.0.1", p1)
+        peer12 = RelayPeer("relay-2", "127.0.0.1", p2, psk=b"mesh-test-psk")
+        peer21 = RelayPeer("relay-1", "127.0.0.1", p1, psk=b"mesh-test-psk")
         r1.mesh.add_peer(peer12)
         r2.mesh.add_peer(peer21)
         await peer12.connect()

@@ -28,6 +28,7 @@ from .frame import CryptoEnvelope, EacpFrame, ExecutionConstraints, HEADER_STRUC
 from .primitives import EacpRendezvousException
 from .security import (
     AgentIdentity,
+    AgentVerifier,
     EnterpriseCA,
     PlatSecGate,
     SecurityManifest,
@@ -492,6 +493,17 @@ class RSessionBase:
             return 0
         pub = sm.manifest.public_bytes
         if not pub or compute_pin(pub) != frame.sender_pin:
+            return 0
+        # PoP (SEC-01): a public manifest proves GRANTS, not possession of
+        # the private key — the request frame itself must carry a valid
+        # signature from the manifest's key before those grants authorize
+        # anything (missing/invalid frame signature -> 0, fail closed)
+        if not (frame.flags & FrameFlags.FLAG_SIGNED):
+            return 0
+        try:
+            if not AgentVerifier.from_public_bytes(pub).verify_frame(frame):
+                return 0
+        except Exception:
             return 0
         return int(sm.manifest.allowed_capabilities)
 
