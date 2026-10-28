@@ -37,7 +37,9 @@ discipline), and cryptographic PIN-routed push delivery.
 
 **Pulses** (heartbeat + cancel) are 8-byte out-of-band signals flowing
 outside the rendezvous: they keep routes alive across flaky edge links and
-cancel in-flight reasoning steps without blocking.
+cancel in-flight reasoning steps without blocking. Cancellation is real:
+the dispatched handler is stopped at its await point, its token escrow is
+refunded, and nothing keeps running after the caller's timeout.
 
 ### The message format
 
@@ -70,6 +72,11 @@ verifiable.
 - **Circular deadlocks are refused** — the relay's `DeadlockGraph`
   rejects `MsgSend` cycles with `EACP_ERR_DEADLOCK_DETECTED` (edges are
   tracked per transaction, so concurrent calls cannot mask a cycle).
+- **Signed traffic is enforced** — senders registered with a key must
+  send Ed25519-signed frames (`EACP_ERR_SIGNATURE_INVALID` otherwise),
+  replayed (sender, tx) transactions are refused
+  (`EACP_ERR_REPLAY_DETECTED`), and registration demands proof of
+  possession against the configured CA.
 - **No zombie routes** — offline push queues respect per-message TTL and a
   global byte/frame budget with an explicit `EACP_ERR_QUEUE_FULL`
   refusal; heartbeat timeouts prune dead transports.
@@ -121,6 +128,12 @@ cargo run --release --manifest-path crates/eacp-relay/Cargo.toml -- --port 8990
 python3 -m eacp.relay --host 0.0.0.0 --port 8990
 ```
 
+> The **Python relay is the reference implementation** — CA verification,
+> signature enforcement, audit ledger, mesh peering and TLS live there. The
+> Rust relay is a performance candidate with a declared-grants gate; see
+> [ARCHITECTURE §8.3](ARCHITECTURE.md) (qualification gaps) before treating
+> the two as interchangeable.
+
 Minimal agent example:
 
 ```python
@@ -156,7 +169,8 @@ src/eacp/           protocol core: frame · security · scheduler · primitives 
                     client · telemetry · ledger · mesh · budget · qos · dtn
 tests/              9 suites: frame · security · scheduler · relay · budget ·
                     enterprise · tactical · rust_relay · protocol_hardening
-docs/               architecture diagram
+bench/              relay benchmark harness (Python vs Rust, identical wire)
+docs/               architecture diagram · benchmarks
 ```
 
 Per-file map: [ARCHITECTURE.md — Appendix](ARCHITECTURE.md#appendix--directory-map).
