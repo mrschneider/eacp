@@ -2,10 +2,11 @@
 
 CI-only helper: runs the unittest discovery exactly like
 ``python -m unittest discover tests -v``. A watchdog thread fires after
-90s: faulthandler dumps the C stacks (loop state) and then we print the
-Python await-stack of EVERY live asyncio.Task — a hung test on Windows
-(proactor drain / wait_closed) otherwise burns the job timeout with no
-stack at all. Then exit non-zero so the job goes red fast.
+90s: it walks every live asyncio event loop found in the GC, prints
+every task with its awaited future (``task._fut_waiter``) and Python
+await-stack, dumps the C stacks via faulthandler, then exits non-zero.
+A Windows-only hang (proactor drain / wait_closed) otherwise burns the
+whole job timeout with no stack at all.
 """
 
 import faulthandler
@@ -20,31 +21,39 @@ import unittest
 DUMP_AFTER_SECONDS = 90
 
 
+def _dump_tasks_on_loop(loop) -> None:
+    print(f"--- loop {loop!r} closed={loop.is_closed()} running={loop.is_running()}", flush=True)
+    try:
+        tasks = asyncio.all_tasks(loop)
+    except Exception as exc:
+        print(f"    all_tasks failed: {exc}", flush=True)
+        return
+    for task in tasks:
+        try:
+            waiter = getattr(task, "_fut_waiter", None)
+            print(
+                f"    Task {task.get_name()} coro={task.get_coro()} state={task._state} "
+                f"waiter={waiter!r}",
+                flush=True,
+            )
+            for fr in task.get_stack(limit=None):
+                print(
+                    f"      {fr.f_code.co_filename}:{fr.f_lineno} in {fr.f_code.co_name}",
+                    flush=True,
+                )
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            print(f"    (task dump error: {exc})", flush=True)
+
+
 def _dump_and_die() -> None:
-    print("==== HANG WATCHDOG: C stacks ====", flush=True)
-    faulthandler.dump_traceback()
-    print("==== HANG WATCHDOG: asyncio task stacks ====", flush=True)
+    print("==== HANG WATCHDOG: asyncio loops and task stacks ====", flush=True)
     seen = set()
     for obj in gc.get_objects():
-        if isinstance(obj, asyncio.Task) and id(obj) not in seen:
+        if isinstance(obj, asyncio.AbstractEventLoop) and id(obj) not in seen:
             seen.add(id(obj))
-            try:
-                print(f"--- Task {obj!r} state={obj._state}", flush=True)
-                stack = obj.get_stack(limit=None)
-                if not stack:
-                    print("    (suspended, no frames captured)", flush=True)
-                for fr in stack:
-                    print(
-                        f"    {fr.f_code.co_filename}:{fr.f_lineno} in {fr.f_code.co_name}",
-                        flush=True,
-                    )
-                    co = fr.f_locals.get(".asyncio_future_blocking")
-                    # surface the awaited future when present
-                    for name, val in fr.f_locals.items():
-                        if isinstance(val, asyncio.Future):
-                            print(f"      awaiting future: {val!r} done={val.done()}", flush=True)
-            except Exception as exc:  # pragma: no cover - diagnostics only
-                print(f"    (dump error: {exc})", flush=True)
+            _dump_tasks_on_loop(obj)
+    print("==== HANG WATCHDOG: C stacks ====", flush=True)
+    faulthandler.dump_traceback()
     print("==== END HANG WATCHDOG ====", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()
