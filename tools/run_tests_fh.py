@@ -21,6 +21,28 @@ import unittest
 DUMP_AFTER_SECONDS = 90
 
 
+def _walk_coro_chain(coro, depth: int = 0) -> None:
+    """Walk a suspended coroutine's cr_await chain — get_stack() stops at
+    generator boundaries, but the cr_await chain reaches the exact await."""
+    import inspect
+    while coro is not None and depth < 40:
+        try:
+            fr = coro.cr_frame
+            if fr is None:
+                print(f"      <unstarted coroutine {coro!r}>", flush=True)
+                return
+            code = fr.f_code
+            print(
+                f"      {code.co_filename}:{fr.f_lineno} in {code.co_name}",
+                flush=True,
+            )
+            coro = coro.cr_await
+            depth += 1
+        except Exception as exc:
+            print(f"      (chain error: {exc})", flush=True)
+            return
+
+
 def _dump_tasks_on_loop(loop) -> None:
     print(f"--- loop {loop!r} closed={loop.is_closed()} running={loop.is_running()}", flush=True)
     try:
@@ -41,6 +63,7 @@ def _dump_tasks_on_loop(loop) -> None:
                     f"      {fr.f_code.co_filename}:{fr.f_lineno} in {fr.f_code.co_name}",
                     flush=True,
                 )
+            _walk_coro_chain(task.get_coro())
         except Exception as exc:  # pragma: no cover - diagnostics only
             print(f"    (task dump error: {exc})", flush=True)
 
