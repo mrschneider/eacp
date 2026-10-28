@@ -10,6 +10,7 @@ mesh request/reply, origin binding, trace propagation, TLS defaults.
 
 import asyncio
 import json
+import socket
 import struct
 import sys
 import time
@@ -24,7 +25,7 @@ from eacp.frame import EacpFrame, ExecutionConstraints, HEADER_STRUCT
 from eacp.ledger import AuditLedger, LedgerIntegrityError
 from eacp.mesh import RelayPeer
 from eacp.primitives import EacpRendezvousException
-from eacp.budget import BudgetError, create_downstream_constraints
+from eacp.budget import BudgetError, TokenBudgetLedger, create_downstream_constraints
 from eacp.relay import DeadlockGraph, EacpRelay
 from eacp.client import RSessionBase
 from eacp.security import (
@@ -830,6 +831,176 @@ class TestTraceAndTls(unittest.TestCase):
         self.assertTrue(ctx.check_hostname)
         insecure = create_client_ssl_context(verify_server=False)
         self.assertEqual(insecure.verify_mode, _ssl.CERT_NONE)  # explicit opt-out only
+
+
+# --------------------------------------------------------------------------
+# Round 2 (pending-changes): RUN-01 admission, RUN-02 escrow identity,
+# QUE-01 per-target overflow, BUD-01 attenuation + preserved spending
+
+
+class TestAdmissionBound(HardenedRelayTestBase):
+    async def test_overflow_refused_at_admission_and_recovers(self):
+        server = RSessionBase(
+            allowed_capabilities=Capability.CAP_TOOL_EXEC,
+            max_concurrent_handlers=1,
+            max_inflight=2,
+        )
+
+        async def slow(frame):
+            await asyncio.sleep(0.4)
+            return {"ok": True}
+
+        server.register_handler("slow", slow)
+        await server.connect(host="127.0.0.1", port=self.port)
+        clients = []
+        for _ in range(4):
+            c = RSessionBase(allowed_capabilities=Capability.CAP_TOOL_EXEC)
+            await c.connect(host="127.0.0.1", port=self.port)
+            clients.append(c)
+        try:
+            sends = [
+                asyncio.ensure_future(
+                    c.send(target_pin=server.pin, verb="slow",
+                           constraints=ExecutionConstraints(timeout_ms=4000))
+                )
+                for c in clients
+            ]
+            gathered = asyncio.gather(*sends, return_exceptions=True)
+            peak = 0
+            while not gathered.done():
+                peak = max(peak, len(server._inflight))
+                await asyncio.sleep(0.02)
+            results = await gathered
+            self.assertLessEqual(peak, 2, "in-flight tasks must respect max_inflight")
+            refused = [
+                r for r in results
+                if isinstance(r, EacpRendezvousException)
+                and r.code == EacpError.EACP_ERR_QUEUE_FULL
+            ]
+            oks = [r for r in results if not isinstance(r, Exception)]
+            self.assertGreaterEqual(len(refused), 1, "overload must surface an explicit QUEUE_FULL")
+            self.assertEqual(len(refused) + len(oks), 4, "every request gets a defined outcome")
+            self.assertEqual(len(server._inflight), 0, "registry drained after completion")
+            # recovery: the next request must be admitted again
+            reply = await clients[0].send(
+                target_pin=server.pin, verb="slow",
+                constraints=ExecutionConstraints(timeout_ms=4000))
+            self.assertEqual(reply.status, EacpError.EACP_SUCCESS)
+        finally:
+            for c in clients:
+                await c.close()
+            await server.close()
+
+
+class TestEscrowKeyIsolation(HardenedRelayTestBase):
+    def test_ledger_same_tx_different_senders_independent(self):
+        led = TokenBudgetLedger(ledger_capacity=1000)
+        led.escrow(("A", 7), 10)
+        led.escrow(("B", 7), 10)  # pre-fix: "txn 7 already escrowed"
+        led.consume(("A", 7), 4)
+        self.assertEqual(led.remaining(("B", 7)), 10, "B's escrow untouched by A's spend")
+        led.refund(("A", 7))
+        self.assertIsNone(led.remaining(("A", 7)))
+        self.assertEqual(led.spent, 4, "consumption stands after refund (BUD-01)")
+
+    async def test_two_senders_same_tx_both_execute(self):
+        from test_ingress_auth import _raw_status, _register
+
+        ran = []
+        server = RSessionBase(allowed_capabilities=Capability.CAP_TOOL_EXEC)
+        server.register_handler("iso", lambda f: ran.append(f.sender_pin) or {"ok": True})
+        await server.connect(host="127.0.0.1", port=self.port)
+        socks = []
+        try:
+            for _ in range(2):
+                s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                ident = AgentIdentity.generate()
+                await _register(s, ident)
+                socks.append((s, ident))
+            for s, ident in socks:
+                fr = EacpFrame(
+                    msg_type=MsgType.MSG_SEND, verb="iso", sender_pin=ident.pin,
+                    target_pin=server.pin, transaction_id=777,  # SAME tx on both
+                    capabilities_mask=int(Capability.NONE),
+                    constraints=ExecutionConstraints(token_budget=50, timeout_ms=3000),
+                    data={},
+                )
+                ident.sign_frame(fr)
+                await asyncio.to_thread(s.sendall, fr.pack())
+            statuses = [await _raw_status(s) for s, _ in socks]
+            self.assertEqual(statuses, [EacpError.EACP_SUCCESS, EacpError.EACP_SUCCESS],
+                             f"both senders must settle independently, got {statuses}")
+            self.assertEqual(len(ran), 2)
+        finally:
+            for s, _ in socks:
+                s.close()
+            await server.close()
+
+
+class TestPerTargetQueueOverflow(HardenedRelayTestBase):
+    async def test_per_target_cap_refuses_explicitly(self):
+        relay = EacpRelay(relay_id="r-pt", max_push_queue=1)
+        await relay.start(host="127.0.0.1", port=0)
+        port = relay.server.sockets[0].getsockname()[1]
+        caller = RSessionBase(allowed_capabilities=Capability.CAP_DISK_READ)
+        await caller.connect(host="127.0.0.1", port=port)
+        try:
+            offline_pin = caller.pin + 0xF00D
+            tx2 = 880111
+            fut = asyncio.get_running_loop().create_future()
+            caller._pending_replies[tx2] = fut
+            for tx in (880110, tx2):
+                fr = EacpFrame(
+                    msg_type=MsgType.MSG_SEND, verb="queued", sender_pin=caller.pin,
+                    target_pin=offline_pin, transaction_id=tx,
+                    constraints=ExecutionConstraints(timeout_ms=10_000),
+                )
+                caller.identity.sign_frame(fr)
+                await asyncio.to_thread(caller.writer.write, fr.pack())
+                await caller.writer.drain()
+            reply = await asyncio.wait_for(fut, timeout=5)
+            self.assertEqual(reply.status, EacpError.EACP_ERR_QUEUE_FULL,
+                             "per-target overflow must be refused, never a silent maxlen eviction")
+            self.assertEqual(relay._queued_total, 1, "only the first frame occupies the queue")
+            edges = relay.deadlock_graph._edges.get(caller.pin, {})
+            self.assertNotIn(tx2, edges, "refused frame's dependency released")
+        finally:
+            await caller.close()
+            await relay.stop()
+
+
+class TestBudgetAttenuation(unittest.TestCase):
+    def test_explicit_override_never_widens_finite_parent(self):
+        frame = EacpFrame(
+            msg_type=MsgType.MSG_SEND, verb="v", sender_pin=1, target_pin=2,
+            transaction_id=1, constraints=ExecutionConstraints(token_budget=100),
+        )
+        self.assertEqual(RSessionBase.create_downstream_constraints(frame, token_budget=500).token_budget, 100)
+        self.assertEqual(RSessionBase.create_downstream_constraints(frame, token_budget=0).token_budget, 100,
+                         "explicit 0 ('unlimited') must not convert a finite parent")
+        self.assertEqual(RSessionBase.create_downstream_constraints(frame, token_budget=40).token_budget, 40)
+        self.assertEqual(RSessionBase.create_downstream_constraints(frame).token_budget, 100)
+
+    def test_unlimited_parent_keeps_explicit_choice(self):
+        frame = EacpFrame(
+            msg_type=MsgType.MSG_SEND, verb="v", sender_pin=1, target_pin=2,
+            transaction_id=1, constraints=ExecutionConstraints(token_budget=0),
+        )
+        self.assertEqual(RSessionBase.create_downstream_constraints(frame, token_budget=0).token_budget, 0)
+        self.assertEqual(RSessionBase.create_downstream_constraints(frame, token_budget=50).token_budget, 50)
+
+    def test_tokens_used_branch_attenuates(self):
+        frame = EacpFrame(
+            msg_type=MsgType.MSG_SEND, verb="v", sender_pin=1, target_pin=2,
+            transaction_id=1, constraints=ExecutionConstraints(token_budget=100),
+        )
+        # parent spent 30 -> child gets 70; explicit 0 is a no-op there
+        self.assertEqual(
+            RSessionBase.create_downstream_constraints(frame, token_budget=0, tokens_used=30).token_budget, 70)
+        self.assertEqual(
+            RSessionBase.create_downstream_constraints(frame, token_budget=500, tokens_used=30).token_budget, 70)
+        self.assertEqual(
+            RSessionBase.create_downstream_constraints(frame, token_budget=50, tokens_used=30).token_budget, 50)
 
 
 if __name__ == "__main__":

@@ -392,8 +392,8 @@ def render(res: dict) -> str:
         if i == 0:
             lines.append("|" + "|".join("-" * (width[j] + 2) for j in range(3)) + "|")
     lines.append("")
-    lines.append("Wire: byte-identical signed frames on both. Python verifies Ed25519")
-    lines.append("per frame; Rust does not yet (ARCHITECTURE.md 8.3). Loopback only.")
+    lines.append("Wire: byte-identical signed frames on both relays; BOTH verify")
+    lines.append("Ed25519 (signing contract v2) per frame. Loopback only.")
     return "\n".join(lines)
 
 

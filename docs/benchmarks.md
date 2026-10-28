@@ -1,7 +1,9 @@
 # Relay benchmarks — Python reference vs Rust candidate
 
-**Harness:** `bench/relay_bench.py` · **Date:** 2026-10-27 · **Host:**
-Intel N100 (4C), 30 GiB RAM, Linux 7.0.0-34, loopback TCP ·
+**Harness:** `bench/relay_bench.py` · **Date:** 2026-10-28 (rerun with
+equivalent security: both relays verify Ed25519 signing-contract-v2 per
+frame; earlier figures predate the Rust signature parity) ·
+**Host:** Intel N100 (4C), 30 GiB RAM, Linux 7.0.0-34, loopback TCP ·
 **Releases:** Python relay from this tree; Rust relay
 `cargo build --release` (thin LTO).
 
@@ -22,25 +24,26 @@ comparable across implementations until the Rust relay has peering
 
 | metric | python relay | rust relay |
 |---|---|---|
-| RTT p50 (ms) | 1.28 | 0.59 |
-| RTT p95 (ms) | 3.20 | 1.13 |
-| RTT p99 (ms) | 5.72 | 1.54 |
-| RTT mean / max (ms) | 1.52 / 8.58 | 0.68 / 3.05 |
-| sequential (req/s) | 936 | 1638 |
-| pipelined conc=32 (req/s) | 2288 | 579 |
-| relay RSS baseline (MiB) | 33.2 | 4.0 |
-| RSS per registered conn (KiB) | 24.7 | 3.8 |
-| healthy p50 during stall (ms) | 2.90 | 0.50 |
-| healthy p99 during stall (ms) | 5.46 | 1.26 |
+| RTT p50 (ms) | 1.08 | 0.71 |
+| RTT p95 (ms) | 1.54 | 0.86 |
+| RTT p99 (ms) | 2.20 | 1.09 |
+| RTT mean / max (ms) | 1.14 / 3.58 | 0.73 / 1.45 |
+| sequential (req/s) | 835 | 1345 |
+| pipelined conc=32 (req/s) | 1976 | 650 |
+| relay RSS baseline (MiB) | 33.3 | 3.9 |
+| RSS per registered conn (KiB) | 24.8 | 4.2 |
+| healthy p50 during stall (ms) | 1.86 | 0.76 |
+| healthy p99 during stall (ms) | 5.25 | 1.06 |
 | stalled-consumer drain (s) | 0.80 | 0.80 |
 | frames sent / drained | 600 / 600 | 600 / 600 |
 
 ## Reading the numbers
 
-- **Security asymmetry:** the wire is byte-identical, but the Python relay
-  verifies Ed25519 signatures per frame and the Rust relay does not verify
-  yet (§8.3). Rust's RTT advantage is the upper bound of that gap —
-  qualification must re-measure after signature verification lands.
+- **Security parity (as of this run):** BOTH relays verify Ed25519
+  signing-contract-v2 signatures per frame with proof-of-possession
+  registration, connection-bound senders and (tx, target) replay refusal.
+  The remaining asymmetry is CA-signed-manifest validation, TLS, mesh,
+  audit and telemetry (§8.3) — not per-frame crypto.
 - **Stalled consumer:** a registered target stops reading; 600 signed
   frames are fired through the relay at it. Both relays keep an unrelated
   client healthy (p99 5.5 ms / 1.3 ms — no contagion) and both deliver
@@ -48,14 +51,15 @@ comparable across implementations until the Rust relay has peering
   The python healthy-p99 tail is its slower burst processing, not a stall
   leak: p50 stays bounded.
 - **Open observation:** the Rust relay is *slower* pipelined (conc=32,
-  579 req/s) than sequential (1638 req/s), reproducible across runs —
-  while Python scales 936 → 2288. This inverts the expected concurrency
-  gain and is tracked as an investigation item for the Rust qualification
-  cycle; do not cite rust pipelined numbers as a strength.
+  650 req/s) than sequential (1345 req/s) — reproduced again AFTER the
+  signature-parity changes, while Python scales 835 → 1976. This inverts
+  the expected concurrency gain and is tracked as an investigation item
+  for the Rust qualification cycle; do not cite rust pipelined numbers as
+  a strength.
 - **Variance:** single run on a shared host; python RTT p50 observed
-  between 0.98–1.67 ms across runs of this session. Treat these as
-  order-of-magnitude, not SLA figures. No p99 production claim is made
-  until a repeatable multi-run harness exists.
+  between 0.98–1.67 ms and p99 between 2.2–5.7 ms across runs of this
+  session. Treat these as order-of-magnitude, not SLA figures. No p99
+  production claim is made until a repeatable multi-run harness exists.
 - **Baseline RSS:** python relay ~33 MiB idle (interpreter + imports) vs
   ~4 MiB for the static Rust binary; per-connection cost is the more
   actionable figure (24.7 vs 3.8 KiB/conn).

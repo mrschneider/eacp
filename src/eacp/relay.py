@@ -144,20 +144,24 @@ class RelayClientSession:
         self.closed: bool = False
         self.last_seen: float = time.monotonic()
         # replay defense: bounded (sender, tx) window per session
-        self._seen_tx: Set[int] = set()
-        self._seen_order: Deque[int] = deque(maxlen=self.REPLAY_WINDOW)
+        self._seen_tx: Set[Tuple[int, int]] = set()
+        # replay identity is (tx, target): a server may legitimately answer
+        # two callers that chose the same transaction id when the targets
+        # differ — identical (session, tx, target) is the replay
+        self._seen_order: Deque[Tuple[int, int]] = deque(maxlen=self.REPLAY_WINDOW)
 
-    def seen_tx(self, tx_id: int) -> bool:
-        return tx_id in self._seen_tx
+    def seen_tx(self, tx_id: int, target_pin: int) -> bool:
+        return (tx_id, target_pin) in self._seen_tx
 
-    def remember_tx(self, tx_id: int) -> None:
-        if tx_id in self._seen_tx:
+    def remember_tx(self, tx_id: int, target_pin: int) -> None:
+        key = (tx_id, target_pin)
+        if key in self._seen_tx:
             return
         if len(self._seen_order) == self.REPLAY_WINDOW:
             old = self._seen_order[0]
             self._seen_tx.discard(old)
-        self._seen_order.append(tx_id)
-        self._seen_tx.add(tx_id)
+        self._seen_order.append(key)
+        self._seen_tx.add(key)
 
     async def send_frame(self, frame: EacpFrame) -> None:
         if self.writer and not self.closed:
@@ -299,14 +303,16 @@ class EacpRelay:
             return False
         queue = self.push_queues.get(target_pin)
         if queue is None:
-            queue = deque(maxlen=self.max_push_queue)
+            queue = deque()
             self.push_queues[target_pin] = queue
-        if len(queue) == queue.maxlen:
-            # per-target cap reached: count the evicted frame out first so
-            # global accounting stays exact (deque evicts silently)
-            _ts, evicted = queue[0]
-            self._queued_total -= 1
-            self._queued_bytes -= self._frame_size(evicted)
+        if len(queue) >= self.max_push_queue:
+            # QUE-01: per-target overflow is EXPLICIT (the caller answers
+            # the sender with QUEUE_FULL and releases the deadlock
+            # dependency) — never the old silent maxlen eviction that
+            # dropped the oldest frame without a trace
+            if self.push_queues[target_pin] is queue and not queue:
+                self.push_queues.pop(target_pin, None)
+            return False
         queue.append((now, frame))
         self._queued_total += 1
         self._queued_bytes += size
@@ -737,7 +743,7 @@ class EacpRelay:
             # replay defense per session: (sender, tx) remembered only after
             # a valid signature, bounded window
             if sender_session is not None:
-                if sender_session.seen_tx(frame.transaction_id):
+                if sender_session.seen_tx(frame.transaction_id, frame.target_pin):
                     self.metrics.platsec_denials.inc(action="route_replay")
                     logger.warning(
                         f"Replay refused: tx {frame.transaction_id} from {format_pin(sender_pin)}"
@@ -747,7 +753,7 @@ class EacpRelay:
                             frame.create_reply(status=EacpError.EACP_ERR_REPLAY_DETECTED)
                         )
                     return
-                sender_session.remember_tx(frame.transaction_id)
+                sender_session.remember_tx(frame.transaction_id, frame.target_pin)
 
         # 1b. Authorization: claimed capabilities must fit the authenticated
         # registration grants (defense at the trust anchor; the receiver

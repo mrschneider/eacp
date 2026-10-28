@@ -256,7 +256,7 @@ The **EACP-Relay** functions as an enterprise push router and rendezvous broker:
 ### 8.1 Responsibilities
 * **Presence & Routing:** Maintains an in-memory lookup table of active Agent-PINs and transport connections.
 * **Offline Buffering (Push):** If a target agent temporarily drops connection (e.g. edge pod restart), non-urgent messages are held in a bounded push queue until reconnection or TTL expiration.
-* **Transit PlatSec Check:** The Relay validates frame digital signatures before routing, dropping spoofed packets at the boundary (Python relay; the Rust relay does not yet verify signatures — see §8.3), enforces registration grants on claimed capabilities, and refuses replayed transactions.
+* **Transit PlatSec Check:** The Relay validates frame digital signatures before routing, dropping spoofed packets at the boundary (both Python and Rust relays: proof-of-possession registration, connection-bound sender identity, Ed25519 signing-contract-v2 verification, (tx, target) replay refusal), enforces registration grants on claimed capabilities, and requires authenticated ingress.
 
 ### 8.2 Native Rust Implementation (`crates/eacp-relay`)
 To target sub-millisecond p99 latency without garbage-collection jitter (essential for strict QoS deadlines; the figure itself is still unbenchmarked — see §8.3), the EACP-Relay provides a high-performance native implementation in Rust (`crates/eacp-relay`):
@@ -266,13 +266,14 @@ To target sub-millisecond p99 latency without garbage-collection jitter (essenti
 * **Small Footprint:** Single ~2.2 MB release binary; per-session memory figures are unbenchmarked.
 
 ### 8.3 Rust Relay qualification gaps
-The Rust relay is a performance candidate, not yet a security-equivalent production replacement for the Python reference relay. Current gaps, tracked for the qualification cycle:
+The Rust relay now shares the Python relay's **frame-level security core**: authenticated ingress (registered-or-refused, connection-bound sender PIN, no pin switching), proof-of-possession registration storing the presented key, Ed25519 verification against signing contract **v2**, declared-grants enforcement, (tx, target) replay refusal, wire version check, and per-transaction deadlock edges — exercised by the CI interop job (binary built, suite run, skips fail the job).
 
-* **No CA/manifest signature verification** — registration accepts the sender's declared PIN and capability mask. Defense today is the declared-grants gate (`claimed ⊆ registered mask` on `MsgSend`); full CA-signed-manifest + proof-of-possession verification exists only in the Python relay.
+Remaining gaps before it is a security-equivalent production replacement:
+
+* **No CA-signed-manifest validation** — the trusted-CA registration path and caller-manifest credentials exist only in the Python relay.
 * **No TLS listener, no audit ledger, no mesh peering, no telemetry** — these subsystems exist only on the Python relay.
-* **No replay protection** — without signature verification there is no per-sender authenticity to bind seen transactions to.
-* **Performance claims unbenchmarked** — p99 latency, session-scale memory and "lock-free/zero-copy" wording were removed until reproducible benchmarks exist.
-* CI now has an **interop job**: builds the Rust binary, runs the full Python suite with it present, and fails if any test is skipped.
+* **Open performance investigation** — pipelined throughput regresses vs sequential (see docs/benchmarks.md); no p99 or session-scale claim is made until multi-run benchmarks exist.
+* CI interop job covers function; adversarial Rust-native tests beyond the shared suite are still thin.
 
 Mesh (§8.1), QoS RxO contracts and DTN are **experimental extensions**: unit-tested, not yet validated in multi-relay production scenarios.
 

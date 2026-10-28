@@ -37,9 +37,11 @@ discipline), and cryptographic PIN-routed push delivery.
 
 **Pulses** (heartbeat + cancel) are 8-byte out-of-band signals flowing
 outside the rendezvous: they keep routes alive across flaky edge links and
-cancel in-flight reasoning steps without blocking. Cancellation is real:
-the dispatched handler is stopped at its await point, its token escrow is
-refunded, and nothing keeps running after the caller's timeout.
+cancel in-flight reasoning steps without blocking. Cancellation is
+**cooperative**: the dispatched handler is stopped at its next `await`
+point and its token escrow is refunded — a handler stuck in synchronous
+blocking code (or one that suppresses `CancelledError`) is outside this
+guarantee and must be written with its own deadline.
 
 ### The message format
 
@@ -53,8 +55,9 @@ verifiable.
 ## Key pillars
 
 1. **Deterministic concurrency (Active Objects)** — one single-threaded
-   cooperative event loop per agent: no thread sprawl, no races, no
-   uncontrolled token usage.
+   cooperative event loop per agent: no thread sprawl and no shared-memory
+   races *between* handlers (a long synchronous handler still stalls the
+   loop — cooperative, not preemptive), bounded token usage throughout.
 2. **Platform Security (PlatSec)** — a 64-bit capability bitmask validated
    at the protocol frame layer before any action or tool executes.
 3. **Synchronous rendezvous (QNX Neutrino IPC)** — `MsgSend` /
@@ -112,7 +115,7 @@ verifiable.
 
 ## Quickstart
 
-Run the test suite (84 tests):
+Run the test suite (103 tests):
 
 ```bash
 python3 -m unittest discover tests -v
@@ -128,11 +131,12 @@ cargo run --release --manifest-path crates/eacp-relay/Cargo.toml -- --port 8990
 python3 -m eacp.relay --host 0.0.0.0 --port 8990
 ```
 
-> The **Python relay is the reference implementation** — CA verification,
-> signature enforcement, audit ledger, mesh peering and TLS live there. The
-> Rust relay is a performance candidate with a declared-grants gate; see
-> [ARCHITECTURE §8.3](ARCHITECTURE.md) (qualification gaps) before treating
-> the two as interchangeable.
+> The **Python relay is the reference implementation** — CA-signed
+> manifest verification, audit ledger, mesh peering and TLS live there.
+> The Rust relay shares the frame-level security core (PoP registration,
+> Ed25519 v2 verification, grants, replay, ingress binding) but is not yet
+> feature-equivalent; see [ARCHITECTURE §8.3](ARCHITECTURE.md) before
+> treating the two as interchangeable.
 
 Minimal agent example:
 
@@ -167,8 +171,9 @@ conformance/        cross-language wire contract: vectors + generator + strict v
 crates/eacp-relay/  native Rust relay daemon (tokio, binary parser, deadlock engine)
 src/eacp/           protocol core: frame · security · scheduler · primitives · relay ·
                     client · telemetry · ledger · mesh · budget · qos · dtn
-tests/              9 suites: frame · security · scheduler · relay · budget ·
-                    enterprise · tactical · rust_relay · protocol_hardening
+tests/              10 suites: frame · security · scheduler · relay · budget ·
+                    enterprise · tactical · rust_relay · protocol_hardening ·
+                    ingress_auth
 bench/              relay benchmark harness (Python vs Rust, identical wire)
 docs/               architecture diagram · benchmarks
 ```

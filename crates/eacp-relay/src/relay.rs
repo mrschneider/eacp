@@ -1,7 +1,7 @@
 //! EACP High-Performance Relay Server Core.
 
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -37,9 +37,13 @@ pub struct RelayState {
     routes: RwLock<HashMap<u64, mpsc::Sender<Bytes>>>,
     /// Authenticated DECLARED capability mask per registered Agent-PIN:
     /// claimed capabilities on MsgSend must fit inside it (mirrors the
-    /// Python relay's registration-grants gate; full CA/signature
-    /// verification is a documented Rust qualification gap)
+    /// Python relay's registration-grants gate; full CA-signed-manifest
+    /// verification remains a documented Rust qualification gap)
     grants: RwLock<HashMap<u64, u64>>,
+    /// Sender public keys proven at registration (proof of possession).
+    /// Frames from keyed senders MUST verify against these (RUST-01:
+    /// signature verification + identity binding parity with Python).
+    verifier_keys: RwLock<HashMap<u64, [u8; 32]>>,
     /// Last activity timestamp per Agent-PIN
     last_seen: RwLock<HashMap<u64, Instant>>,
     /// QNX Neutrino-style rendezvous deadlock graph
@@ -54,6 +58,7 @@ impl RelayState {
             config,
             routes: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
+            verifier_keys: RwLock::new(HashMap::new()),
             last_seen: RwLock::new(HashMap::new()),
             deadlock: Mutex::new(DeadlockGraph::new()),
             push_queues: Mutex::new(HashMap::new()),
@@ -109,6 +114,10 @@ impl RelayState {
             grants.remove(&pin);
         }
         {
+            let mut keys = self.verifier_keys.write().await;
+            keys.remove(&pin);
+        }
+        {
             let mut ls = self.last_seen.write().await;
             ls.remove(&pin);
         }
@@ -145,6 +154,32 @@ impl RelayState {
     }
 }
 
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Extracts the sender's presented public key from slot 1 (`pub_bytes`).
+fn sender_pub_key(frame: &EacpFrame) -> Option<[u8; 32]> {
+    let p = &frame.payload;
+    if p.len() < 16 {
+        return None;
+    }
+    let l0 = u32::from_be_bytes(p[0..4].try_into().ok()?) as usize;
+    let l1 = u32::from_be_bytes(p[4..8].try_into().ok()?) as usize;
+    if 16 + l0 + l1 > p.len() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&p[16 + l0..16 + l0 + l1]).ok()?;
+    hex32(v.get("pub_bytes")?.as_str()?)
+}
+
 /// Runs connection handler for an established client stream.
 pub async fn handle_connection<S>(
     stream: S,
@@ -170,6 +205,10 @@ pub async fn handle_connection<S>(
     });
 
     let mut registered_pin: Option<u64> = None;
+    // replay identity (tx, target) — windowed like the Python session
+    const REPLAY_WINDOW: usize = 2048;
+    let mut seen_tx: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen_order: VecDeque<(u64, u64)> = VecDeque::new();
     let mut header_buf = [0u8; HEADER_SIZE];
 
     loop {
@@ -205,11 +244,35 @@ pub async fn handle_connection<S>(
 
         let frame = EacpFrame::new(header, Bytes::from(payload_buf));
 
-        // 1. Check for registration control frame
+        // 1. Registration: present a key AND prove possession of it
+        //    (RUST-01 parity with the Python relay — no keyless or
+        //    unproven registrations, no pin switching on one connection)
         if frame.header.msg_type == MsgType::MsgRelayControl as u8
             && frame.header.opcode == opcode::OP_RELAY_REGISTER
         {
             let pin = frame.header.sender_pin;
+            let reject: Option<&str> = if registered_pin.is_some() && registered_pin != Some(pin) {
+                Some("connection already authenticated for another PIN")
+            } else {
+                match sender_pub_key(&frame) {
+                    None => Some("registration must present a 32-byte pub_bytes key"),
+                    Some(pk) if !frame.verify_sender_signature(&pk) => Some(
+                        "no proof of possession: registration frame not signed by the presented key",
+                    ),
+                    Some(_) => None,
+                }
+            };
+            if let Some(reason) = reject {
+                warn!(pin = format!("0x{:016X}", pin), reason = reason, "Registration refused");
+                let err = frame.create_reply(
+                    error_code::EACP_ERR_SIGNATURE_INVALID,
+                    Some(&serde_json::json!({ "error": reason })),
+                );
+                let _ = tx.send(err.to_bytes()).await;
+                break;
+            }
+            let pk = sender_pub_key(&frame).expect("validated above");
+            state.verifier_keys.write().await.insert(pin, pk);
             registered_pin = Some(pin);
             state.register_agent(pin, tx.clone(), frame.header.capabilities_mask).await;
 
@@ -227,6 +290,72 @@ pub async fn handle_connection<S>(
 
         if let Some(pin) = registered_pin {
             state.update_last_seen(pin).await;
+        }
+
+        // SEC-01 parity: application frames only from THIS connection's
+        // authenticated PIN (the Rust relay has no mesh — every connection
+        // is an agent connection)
+        if frame.header.msg_type != MsgType::MsgRelayControl as u8 {
+            let bad = match registered_pin {
+                None => Some("unauthenticated ingress: register before sending application frames"),
+                Some(p) if p != frame.header.sender_pin => {
+                    Some("sender identity is not bound to this connection")
+                }
+                _ => None,
+            };
+            if let Some(reason) = bad {
+                warn!(reason = reason, "Refusing application frame at ingress");
+                let err = frame.create_reply(
+                    error_code::EACP_ERR_SIGNATURE_INVALID,
+                    Some(&serde_json::json!({ "error": reason })),
+                );
+                let _ = tx.send(err.to_bytes()).await;
+                break;
+            }
+        }
+
+        // Signature verification + replay for authenticated traffic
+        // (signing contract v2 — byte-identical to the Python verifier)
+        if frame.header.msg_type == MsgType::MsgSend as u8
+            || frame.header.msg_type == MsgType::MsgReply as u8
+        {
+            let key = {
+                let keys = state.verifier_keys.read().await;
+                keys.get(&frame.header.sender_pin).copied()
+            };
+            let mut refused: Option<u32> = None;
+            match key {
+                Some(pk) if frame.verify_sender_signature(&pk) => {
+                    let k = (frame.header.transaction_id, frame.header.target_pin);
+                    if seen_tx.contains(&k) {
+                        refused = Some(error_code::EACP_ERR_REPLAY_DETECTED);
+                    } else {
+                        if seen_order.len() >= REPLAY_WINDOW {
+                            if let Some(old) = seen_order.pop_front() {
+                                seen_tx.remove(&old);
+                            }
+                        }
+                        seen_order.push_back(k);
+                        seen_tx.insert(k);
+                    }
+                }
+                _ => refused = Some(error_code::EACP_ERR_SIGNATURE_INVALID),
+            }
+            if let Some(code) = refused {
+                warn!(
+                    sender = format!("0x{:016X}", frame.header.sender_pin),
+                    code = code,
+                    "Refusing frame (signature/replay)"
+                );
+                if frame.header.msg_type == MsgType::MsgSend as u8 {
+                    let err = frame.create_reply(
+                        code,
+                        Some(&serde_json::json!({ "error": "frame authentication refused" })),
+                    );
+                    let _ = tx.send(err.to_bytes()).await;
+                }
+                continue;
+            }
         }
 
         // 2. Pulse handling

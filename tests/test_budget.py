@@ -160,7 +160,7 @@ class TestBudgetOverWire(unittest.IsolatedAsyncioTestCase):
         async def hungry_handler(frame):
             # Spend incrementally: 3 x 400 against a 1000 budget
             for _ in range(3):
-                server.spend_tokens(frame.transaction_id, 400)
+                server.spend_tokens(frame.transaction_id, 400, sender_pin=frame.sender_pin)
             return "should never get here"
 
         server.register_handler("hungry", hungry_handler)

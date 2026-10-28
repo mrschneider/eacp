@@ -1,6 +1,7 @@
 //! EACP 48-byte binary frame parser and serializer.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::constants::{
     error_code, flags, opcode, MsgType, EACP_MAGIC, EACP_VERSION, HEADER_SIZE, RELAY_PIN,
 };
@@ -183,5 +184,75 @@ impl EacpFrame {
         };
 
         Self::new(header, reply_payload)
+    }
+
+    /// Signing contract v2 (SEC-02), byte-identical to the Python
+    /// reference `get_signed_bytes()`: header (FLAG_COMPRESSED excluded,
+    /// FLAG_SIGNED forced, payload_len = 16 + slots0..2 + 68) followed by
+    /// the 16-byte slot length block, slots 0..2 and the 4-byte
+    /// session-handle prefix of slot 3. The length block IS authenticated,
+    /// so a boundary repartition changes the signature input.
+    pub fn signed_bytes_v2(&self) -> Option<Bytes> {
+        let p = &self.payload;
+        if p.len() < 24 {
+            return None;
+        }
+        let l0 = u32::from_be_bytes(p[0..4].try_into().ok()?) as usize;
+        let l1 = u32::from_be_bytes(p[4..8].try_into().ok()?) as usize;
+        let l2 = u32::from_be_bytes(p[8..12].try_into().ok()?) as usize;
+        let l3 = u32::from_be_bytes(p[12..16].try_into().ok()?) as usize;
+        if 16usize + l0 + l1 + l2 + l3 != p.len() {
+            return None;
+        }
+        if l3 < 68 {
+            return None; // session handle (4) + signature (64)
+        }
+        let covered = 20 + l0 + l1 + l2; // through the session-handle prefix
+        if p.len() < covered + 64 {
+            return None;
+        }
+        let mut h = self.header;
+        h.flags = (h.flags & !flags::FLAG_COMPRESSED) | flags::FLAG_SIGNED;
+        h.payload_len = (16 + l0 + l1 + l2 + 68) as u32;
+        let mut buf = BytesMut::with_capacity(48 + covered);
+        buf.extend_from_slice(&h.to_bytes());
+        buf.extend_from_slice(&p[..covered]);
+        Some(buf.freeze())
+    }
+
+    /// Verifies the frame's Ed25519 signature against a known sender key
+    /// (RFC 8032 pure — same acceptance domain as the Python verifier).
+    pub fn verify_sender_signature(&self, pub_bytes: &[u8; 32]) -> bool {
+        if self.header.flags & flags::FLAG_SIGNED == 0 {
+            return false;
+        }
+        let p = &self.payload;
+        if p.len() < 24 {
+            return false;
+        }
+        let l0 = u32::from_be_bytes(p[0..4].try_into().unwrap()) as usize;
+        let l1 = u32::from_be_bytes(p[4..8].try_into().unwrap()) as usize;
+        let l2 = u32::from_be_bytes(p[8..12].try_into().unwrap()) as usize;
+        let sig_start = 16 + l0 + l1 + l2 + 4;
+        if p.len() < sig_start + 64 {
+            return false;
+        }
+        let sig_bytes: [u8; 64] = match p[sig_start..sig_start + 64].try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let sig = match Signature::from_slice(&sig_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let vk = match VerifyingKey::from_bytes(pub_bytes) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let msg = match self.signed_bytes_v2() {
+            Some(m) => m,
+            None => return false,
+        };
+        vk.verify(&msg, &sig).is_ok()
     }
 }

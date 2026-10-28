@@ -109,7 +109,16 @@ class TokenBudgetLedger:
         self._capacity = ledger_capacity
         self._reserved = 0            # sum of active (non-unlimited) escrows
         self._escrows: Dict[int, EscrowEntry] = {}
+        # cumulative consumption across committed AND failed/cancelled
+        # transactions (BUD-01): refunding an escrow releases the
+        # reservation, never the spend already incurred
+        self._spent = 0
         self._lock = threading.Lock()
+
+    @property
+    def spent(self) -> int:
+        with self._lock:
+            return self._spent
 
     @property
     def capacity(self) -> int:
@@ -157,6 +166,7 @@ class TokenBudgetLedger:
                 raise BudgetError(f"txn {txn_id} already committed")
             if entry.budget == UNLIMITED_BUDGET:
                 entry.consumed += tokens
+                self._spent += tokens
                 return UNLIMITED_BUDGET
             if entry.consumed + tokens > entry.budget:
                 raise BudgetError(
@@ -164,6 +174,7 @@ class TokenBudgetLedger:
                     f"used {entry.consumed} + spend {tokens} > escrowed {entry.budget}"
                 )
             entry.consumed += tokens
+            self._spent += tokens
             return entry.budget - entry.consumed
 
     def commit(self, txn_id: int) -> int:
@@ -180,7 +191,11 @@ class TokenBudgetLedger:
             return entry.budget - entry.consumed if entry.budget != UNLIMITED_BUDGET else 0
 
     def refund(self, txn_id: int) -> None:
-        """Full deterministic rollback of the escrow (failure path)."""
+        """Releases the escrow reservation (failure/cancel path).
+
+        BUD-01: already-incurred consumption is NOT rolled back — tokens
+        counted by consume() stay in `spent`; only the unused reservation
+        returns to capacity."""
         with self._lock:
             entry = self._escrows.pop(txn_id, None)
             if entry and entry.budget != UNLIMITED_BUDGET:

@@ -67,6 +67,7 @@ class RSessionBase:
         token_ledger_capacity: int = 1_000_000,
         enterprise_ca: Optional[EnterpriseCA] = None,
         max_concurrent_handlers: int = 64,
+        max_inflight: int = 0,
     ):
         self.identity: AgentIdentity = identity or AgentIdentity.generate()
         self.signed_manifest = signed_manifest
@@ -90,6 +91,10 @@ class RSessionBase:
         self._handler_gate: Optional[asyncio.Semaphore] = None
         # request registry: (sender_pin, tx_id) -> in-flight handler task
         self._inflight: Dict[Tuple[int, int], asyncio.Task] = {}
+        # RUN-01 admission bound: waiting AND running handler tasks capped
+        # (the semaphore bounds running work only; unbounded queued tasks
+        # are the memory hazard). Exhaustion is an explicit QUEUE_FULL.
+        self._max_inflight = max_inflight or max_concurrent_handlers * 4
         
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -397,8 +402,26 @@ class RSessionBase:
                     # gate inside the request registry (bounded concurrency,
                     # cancellation, disconnect cleanup)
                     if frame.verb in self._action_handlers:
-                        task = asyncio.create_task(self._dispatch_handler(frame))
-                        self._inflight[(frame.sender_pin, frame.transaction_id)] = task
+                        if len(self._inflight) >= self._max_inflight:
+                            # RUN-01: refuse at ADMISSION — no task is
+                            # created, so waiting work cannot pile up
+                            # (the semaphore alone only bounds running ones)
+                            logger.warning(
+                                "admission capacity exhausted: refusing tx %s "
+                                "(inflight=%d, cap=%d)",
+                                frame.transaction_id, len(self._inflight), self._max_inflight,
+                            )
+                            await self.reply(
+                                frame,
+                                status=EacpError.EACP_ERR_QUEUE_FULL,
+                                result_data={
+                                    "error": "admission capacity exhausted "
+                                    "(running + waiting handlers at cap)"
+                                },
+                            )
+                        else:
+                            task = asyncio.create_task(self._dispatch_handler(frame))
+                            self._inflight[(frame.sender_pin, frame.transaction_id)] = task
                     else:
                         await self._incoming_requests.put(frame)
 
@@ -428,18 +451,33 @@ class RSessionBase:
         """
         from .budget import create_downstream_constraints as cascade_constraints
 
+        parent_budget = frame.constraints.token_budget if frame.constraints else 0  # 0 = unlimited
+
         if tokens_used:
             child = cascade_constraints(frame, tokens_used, timeout_ms=timeout_ms)
-            if token_budget is not None:
-                # explicit cap: never replace an unlimited child with None,
-                # and take the tighter of the two when both constrain
+            if token_budget is not None and token_budget != 0:
+                # explicit finite cap: never replace an unlimited child with
+                # None, take the tighter of the two when both constrain.
+                # BUD-01: an explicit 0 ("unlimited") is a NO-OP for a
+                # finite child — a downstream path may only attenuate.
                 child.token_budget = (
                     token_budget if child.token_budget == 0 else min(child.token_budget, token_budget)
                 )
             return child
 
+        # BUD-01 attenuation: explicit overrides may tighten, never widen
+        # (a finite parent cannot be raised, and 0/unlimited cannot be
+        # requested under it)
+        if token_budget is not None:
+            if parent_budget == 0:
+                budget = token_budget
+            elif token_budget == 0:
+                budget = parent_budget
+            else:
+                budget = min(token_budget, parent_budget)
+        else:
+            budget = parent_budget
         parent_hops = frame.constraints.max_depth_hops if frame.constraints else 10
-        budget = token_budget if token_budget is not None else (frame.constraints.token_budget if frame.constraints else 0)
         timeout = timeout_ms if timeout_ms is not None else (frame.constraints.timeout_ms if frame.constraints else 5000)
         return ExecutionConstraints(
             token_budget=budget,
@@ -447,24 +485,30 @@ class RSessionBase:
             max_depth_hops=max(0, parent_hops - 1),
         )
 
-    def spend_tokens(self, txn_id: int, tokens: int) -> int:
+    def spend_tokens(self, txn_id: int, tokens: int, sender_pin: Optional[int] = None) -> int:
         """
         Incremental metering hook for handlers: spends `tokens` mid-transaction
         against the active escrow. Raises BudgetError on overflow (the handler
         should stop work immediately; the dispatcher settles/refunds on return).
+
+        RUN-02: dispatcher escrows are keyed (sender_pin, tx) — pass
+        `sender_pin=frame.sender_pin` from inside a handler so the key
+        matches; bare txn ids keep working for direct-ledger use.
         """
-        return self.ledger.consume(txn_id, tokens)
+        key = (sender_pin, txn_id) if sender_pin is not None else txn_id
+        return self.ledger.consume(key, tokens)
 
     def _semaphore(self) -> asyncio.Semaphore:
         if self._handler_gate is None:
             self._handler_gate = asyncio.Semaphore(self._max_concurrent_handlers)
         return self._handler_gate
 
-    def _safe_refund(self, txn_id: int) -> None:
-        """Refund if an escrow is still open (no-op after commit)."""
+    def _safe_refund(self, key) -> None:
+        """Refund if an escrow is still open (no-op after commit).
+        Key is the same (sender, tx) identity the dispatcher escrowed."""
         try:
-            if self.ledger.remaining(txn_id) is not None:
-                self.ledger.refund(txn_id)
+            if self.ledger.remaining(key) is not None:
+                self.ledger.refund(key)
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -559,7 +603,7 @@ class RSessionBase:
                 # without spending a single unit of compute (fail-closed).
                 budget = frame.constraints.token_budget if frame.constraints else 0
                 try:
-                    self.ledger.escrow(frame.transaction_id, budget)
+                    self.ledger.escrow(key, budget)
                     escrowed = True
                 except BudgetError as esc_err:
                     await self.reply(
@@ -578,9 +622,9 @@ class RSessionBase:
                     pre = int(est_fn(frame))
                     if pre:
                         try:
-                            self.ledger.consume(frame.transaction_id, pre)
+                            self.ledger.consume(key, pre)
                         except BudgetError as pre_err:
-                            self.ledger.refund(frame.transaction_id)
+                            self.ledger.refund(key)
                             escrowed = False
                             await self.reply(
                                 frame,
@@ -601,9 +645,9 @@ class RSessionBase:
                     usage = total - pre if pre else total
                     if usage > 0:
                         try:
-                            self.ledger.consume(frame.transaction_id, usage)
+                            self.ledger.consume(key, usage)
                         except BudgetError as over_err:
-                            self.ledger.refund(frame.transaction_id)
+                            self.ledger.refund(key)
                             escrowed = False
                             await self.reply(
                                 frame,
@@ -611,7 +655,7 @@ class RSessionBase:
                                 result_data={"error": "token budget overflow", "detail": over_err.detail},
                             )
                             return
-                    remaining = self.ledger.commit(frame.transaction_id)
+                    remaining = self.ledger.commit(key)
                     escrowed = False
                     logger.debug(
                         "span=handler verb=%s tx=%d trace=%s ms=%.3f",
@@ -623,7 +667,7 @@ class RSessionBase:
                     await self.reply(frame, status=EacpError.EACP_SUCCESS, result_data=res, remaining_budget=remaining)
                 except BudgetError as bud_err:
                     # Handler itself hit the envelope (e.g. via spend_tokens): refund + overflow reply
-                    self.ledger.refund(frame.transaction_id)
+                    self.ledger.refund(key)
                     escrowed = False
                     await self.reply(
                         frame,
@@ -631,7 +675,7 @@ class RSessionBase:
                         result_data={"error": "token budget overflow", "detail": bud_err.detail},
                     )
                 except Exception as exc:
-                    self.ledger.refund(frame.transaction_id)
+                    self.ledger.refund(key)
                     escrowed = False
                     logger.error(f"Error executing action {frame.verb}: {exc}", exc_info=True)
                     await self.reply(frame, status=EacpError.EACP_ERR_CANCELLED, result_data={"error": str(exc)})
@@ -643,7 +687,7 @@ class RSessionBase:
             # performed need their own compensation (cleanup != rollback of
             # the outside world; see ARCHITECTURE).
             if escrowed:
-                self._safe_refund(frame.transaction_id)
+                self._safe_refund(key)
                 escrowed = False
             logger.debug(
                 "handler cancelled verb=%s tx=%d ms=%.3f",
@@ -663,7 +707,7 @@ class RSessionBase:
         finally:
             self._inflight.pop(key, None)
             if escrowed:
-                self._safe_refund(frame.transaction_id)
+                self._safe_refund(key)
 
     async def close(self) -> None:
         """Closes client session (and cancels every in-flight handler —
