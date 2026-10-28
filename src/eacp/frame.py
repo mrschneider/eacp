@@ -91,15 +91,23 @@ class EacpFrame:
     constraints: ExecutionConstraints = field(default_factory=ExecutionConstraints)
     envelope: CryptoEnvelope = field(default_factory=CryptoEnvelope)
     raw_payload: Optional[bytes] = None
+    # Exact wire bytes the frame was parsed FROM (header + payload). Cached
+    # at unpack() so a relay can forward it verbatim with zero re-encode.
+    # Cleared on any post-construction field mutation (see __setattr__) so a
+    # tampered frame falls back to re-encoding and the change is visible.
+    _wire: Optional[bytes] = None
 
     def __setattr__(self, name: str, value: object) -> None:
         """Post-construction mutation of any field invalidates the parsed
-        wire cache (raw_payload): verification must still SEE tampering
-        (test_frame_signing_and_verification re-encodes mutated fields),
-        while the unmodified relay verify path keeps the zero-re-encode
-        fast path in get_signed_bytes."""
-        if name != "raw_payload" and self.__dict__.get("raw_payload") is not None:
-            object.__setattr__(self, "raw_payload", None)
+        wire caches (raw_payload and _wire): verification must still SEE
+        tampering (test_frame_signing_and_verification re-encodes mutated
+        fields), while the unmodified relay verify/forward path keeps the
+        zero-re-encode fast path in get_signed_bytes / pack."""
+        if name not in ("raw_payload", "_wire"):
+            if self.__dict__.get("raw_payload") is not None:
+                object.__setattr__(self, "raw_payload", None)
+            if self.__dict__.get("_wire") is not None:
+                object.__setattr__(self, "_wire", None)
         object.__setattr__(self, name, value)
 
     def is_pulse(self) -> bool:
@@ -212,7 +220,12 @@ class EacpFrame:
                     # Contract locked by the conformance vectors: the signed
                     # bytes are header + slots WITHOUT the 16-byte length
                     # block; the block only feeds the header's payload_len.
-                    flags = int(self.flags) | int(FrameFlags.FLAG_SIGNED)
+                    # FLAG_COMPRESSED is a TRANSPORT encoding bit decided by
+                    # pack() AFTER signing — it is excluded from the
+                    # authenticated header so compression can never invalidate
+                    # a legitimate signature (and the decompression bound in
+                    # unpack() keeps the excluded bit from becoming a bomb).
+                    flags = (int(self.flags) & ~int(FrameFlags.FLAG_COMPRESSED)) | int(FrameFlags.FLAG_SIGNED)
                     lens = struct.pack(">IIII", l0, l1, l2, 4)
                     payload_len_field = len(lens) + len(slots_012) + len(s3_head) + 64
                     hdr = HEADER_STRUCT.pack(
@@ -240,8 +253,10 @@ class EacpFrame:
             slot1 = str(self.data).encode("utf-8")
         slot2 = (self.constraints or ExecutionConstraints()).pack()
 
-        # Header with FLAG_SIGNED ensured
-        flags = int(self.flags) | int(FrameFlags.FLAG_SIGNED)
+        # Header with FLAG_SIGNED ensured; FLAG_COMPRESSED excluded (see
+        # get_signed_bytes fast path: compression is transport encoding,
+        # not authenticated state)
+        flags = (int(self.flags) & ~int(FrameFlags.FLAG_COMPRESSED)) | int(FrameFlags.FLAG_SIGNED)
         
         # Calculate total payload for slots 0..2 + envelope prefix (session handle)
         slot3_prefix = struct.pack(">I", self.envelope.session_handle if self.envelope else 0)
@@ -266,6 +281,13 @@ class EacpFrame:
         return hdr + slot0 + slot1 + slot2 + slot3_prefix
 
     def pack(self) -> bytes:
+        # Fast path: forward the exact wire bytes we were parsed from. This
+        # is the relay's dominant per-frame cost (JSON re-encode of the
+        # payload slots, ~80-150 us/frame); returning the cache verbatim is
+        # byte-identical for an unmodified frame and invalidates on any field
+        # mutation via __setattr__ (tamper detection preserved).
+        if self._wire is not None:
+            return self._wire
         payload = self.pack_slots()
         payload_len = len(payload)
         header = HEADER_STRUCT.pack(
@@ -319,12 +341,32 @@ class EacpFrame:
                 capabilities_mask=cap_mask,
                 status=status,
                 raw_payload=payload,
+                _wire=buffer,
             )
 
-        # Transparent decompression if FLAG_COMPRESSED is set
+        # Transparent decompression if FLAG_COMPRESSED is set. Bounded: the
+        # wire limit must also bound DECOMPRESSED memory, or a small
+        # compressed bomb defeats the payload cap. The bound is
+        # min(wire*16, max(DEFAULT_MAX_PAYLOAD_SIZE, wire)): a 16:1 ratio
+        # cap (legit payloads compress 2-4x; a rarer frame is refused with
+        # a clear error, never truncated), never below the wire allowance
+        # and never above max(default, operator config).
         effective_payload = payload
         if flags & FrameFlags.FLAG_COMPRESSED:
-            effective_payload = zlib.decompress(payload)
+            decomp_limit = min(
+                max_payload_size * 16,
+                max(DEFAULT_MAX_PAYLOAD_SIZE, max_payload_size),
+            )
+            try:
+                obj = zlib.decompressobj()
+                effective_payload = obj.decompress(payload, decomp_limit + 1)
+                effective_payload += obj.flush()
+            except zlib.error as e:
+                raise ValueError(f"Malformed compressed payload: {e}") from e
+            if len(effective_payload) > decomp_limit or obj.unconsumed_tail:
+                raise ValueError(
+                    f"Decompressed payload {len(effective_payload)} exceeds limit {decomp_limit}"
+                )
 
         verb, data, constraints, envelope = cls.unpack_slots(effective_payload)
         return cls(
@@ -343,6 +385,7 @@ class EacpFrame:
             constraints=constraints,
             envelope=envelope,
             raw_payload=effective_payload,
+            _wire=buffer,
         )
 
     def create_reply(self, status: int = EacpError.EACP_SUCCESS, result_data: Any = None) -> EacpFrame:
@@ -352,7 +395,10 @@ class EacpFrame:
             version=self.version,
             msg_type=MsgType.MSG_REPLY,
             opcode=self.opcode,
-            flags=self.flags & ~FrameFlags.FLAG_URGENT,
+            # a reply is a NEW frame: it signs (and compresses) itself —
+            # inheriting FLAG_SIGNED without a signature or a stale
+            # FLAG_COMPRESSED would ship an invalid claim
+            flags=self.flags & ~FrameFlags.FLAG_URGENT & ~FrameFlags.FLAG_SIGNED & ~FrameFlags.FLAG_COMPRESSED,
             sender_pin=self.target_pin,
             target_pin=self.sender_pin,
             transaction_id=self.transaction_id,

@@ -71,4 +71,6 @@ pub mod error_code {
     pub const EACP_ERR_MALFORMED_FRAME: u32 = 9;
     pub const EACP_ERR_DISCONNECTED: u32 = 10;
     pub const EACP_ERR_DEPTH_EXCEEDED: u32 = 11;
+    pub const EACP_ERR_REPLAY_DETECTED: u32 = 12;
+    pub const EACP_ERR_QUEUE_FULL: u32 = 13;
 }

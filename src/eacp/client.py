@@ -9,7 +9,8 @@ import inspect
 import itertools
 import logging
 import ssl
-from typing import Any, Callable, Coroutine, Dict, Optional
+import time
+from typing import Any, Callable, Coroutine, Dict, Optional, Tuple
 
 from .constants import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
@@ -25,7 +26,15 @@ from .constants import (
 )
 from .frame import CryptoEnvelope, EacpFrame, ExecutionConstraints, HEADER_STRUCT
 from .primitives import EacpRendezvousException
-from .security import AgentIdentity, PlatSecGate, SecurityManifest, SignedManifest, format_pin
+from .security import (
+    AgentIdentity,
+    EnterpriseCA,
+    PlatSecGate,
+    SecurityManifest,
+    SignedManifest,
+    compute_pin,
+    format_pin,
+)
 from .telemetry import TraceContext
 from .budget import (
     BudgetError,
@@ -55,6 +64,8 @@ class RSessionBase:
         max_payload_size: int = DEFAULT_MAX_PAYLOAD_SIZE,
         token_meter: Optional[TokenMeter] = None,
         token_ledger_capacity: int = 1_000_000,
+        enterprise_ca: Optional[EnterpriseCA] = None,
+        max_concurrent_handlers: int = 64,
     ):
         self.identity: AgentIdentity = identity or AgentIdentity.generate()
         self.signed_manifest = signed_manifest
@@ -72,6 +83,12 @@ class RSessionBase:
         self.max_payload_size = max_payload_size
         self.token_meter: TokenMeter = token_meter or PayloadTokenMeter()
         self.ledger: TokenBudgetLedger = TokenBudgetLedger(ledger_capacity=token_ledger_capacity)
+        # CA mode: incoming callers must prove CA-attested grants
+        self.enterprise_ca = enterprise_ca
+        self._max_concurrent_handlers = max_concurrent_handlers
+        self._handler_gate: Optional[asyncio.Semaphore] = None
+        # request registry: (sender_pin, tx_id) -> in-flight handler task
+        self._inflight: Dict[Tuple[int, int], asyncio.Task] = {}
         
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -226,6 +243,16 @@ class RSessionBase:
         constr = constraints or ExecutionConstraints()
         cap_mask = capabilities_mask if capabilities_mask is not None else int(self.manifest.allowed_capabilities)
         tc = trace_context or TraceContext.new_root()
+        # Wire propagation (additive JSON keys, authenticated by the frame
+        # signature that is applied below): the trace context travels with
+        # the request, and in CA mode the caller's CA-attested manifest
+        # travels too so the receiver can authorize against GRANTS rather
+        # than against a self-made claim.
+        if isinstance(data, dict):
+            data = dict(data)  # never mutate the caller's dict
+            data.setdefault("_trace", tc.to_header())
+            if self.signed_manifest is not None:
+                data["_caller_manifest"] = self.signed_manifest.to_dict()
 
         frame = EacpFrame(
             msg_type=MsgType.MSG_SEND,
@@ -336,9 +363,25 @@ class RSessionBase:
                     fut = self._pending_replies.get(frame.transaction_id)
                     if fut and not fut.done():
                         fut.set_result(frame)
+                    elif frame.msg_type == MsgType.MSG_REPLY:
+                        # reply correlation: a reply nobody is waiting for is
+                        # logged, never silently swallowed
+                        logger.debug("unexpected reply for tx %s (no waiter)", frame.transaction_id)
 
                 elif frame.msg_type == MsgType.MSG_PULSE:
                     code, val = frame.get_pulse_data()
+                    if code == PulseCode.PULSE_CANCEL:
+                        # cancellation is real: the in-flight handler task is
+                        # cancelled at its await point (escrow refunded in
+                        # the handler's cleanup), not merely noted
+                        task = self._inflight.get((frame.sender_pin, frame.transaction_id))
+                        if task is not None and not task.done():
+                            logger.debug(
+                                "PULSE_CANCEL for tx %s from %s: cancelling handler",
+                                frame.transaction_id,
+                                frame.sender_pin,
+                            )
+                            task.cancel()
                     # Check registered callback
                     cb = self._pulse_callbacks.get(code)
                     if cb:
@@ -349,9 +392,12 @@ class RSessionBase:
                         await self._incoming_requests.put(frame)
 
                 elif frame.msg_type == MsgType.MSG_SEND:
-                    # If registered handler exists, execute through PlatSec gate
+                    # If registered handler exists, execute through PlatSec
+                    # gate inside the request registry (bounded concurrency,
+                    # cancellation, disconnect cleanup)
                     if frame.verb in self._action_handlers:
-                        asyncio.create_task(self._dispatch_handler(frame))
+                        task = asyncio.create_task(self._dispatch_handler(frame))
+                        self._inflight[(frame.sender_pin, frame.transaction_id)] = task
                     else:
                         await self._incoming_requests.put(frame)
 
@@ -384,7 +430,11 @@ class RSessionBase:
         if tokens_used:
             child = cascade_constraints(frame, tokens_used, timeout_ms=timeout_ms)
             if token_budget is not None:
-                child.token_budget = min(child.token_budget, token_budget) if child.token_budget else token_budget
+                # explicit cap: never replace an unlimited child with None,
+                # and take the tighter of the two when both constrain
+                child.token_budget = (
+                    token_budget if child.token_budget == 0 else min(child.token_budget, token_budget)
+                )
             return child
 
         parent_hops = frame.constraints.max_depth_hops if frame.constraints else 10
@@ -404,75 +454,212 @@ class RSessionBase:
         """
         return self.ledger.consume(txn_id, tokens)
 
+    def _semaphore(self) -> asyncio.Semaphore:
+        if self._handler_gate is None:
+            self._handler_gate = asyncio.Semaphore(self._max_concurrent_handlers)
+        return self._handler_gate
+
+    def _safe_refund(self, txn_id: int) -> None:
+        """Refund if an escrow is still open (no-op after commit)."""
+        try:
+            if self.ledger.remaining(txn_id) is not None:
+                self.ledger.refund(txn_id)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _caller_grants(self, frame: EacpFrame) -> Optional[int]:
+        """Authenticated caller grants (CA mode only).
+
+        Returns the CA-attested allowed capabilities of the caller — verified
+        against the CONFIGURED CA key with pin/key binding — or 0 when CA
+        mode is on and no valid manifest travelled with the request (a
+        missing attestation is NOT a wildcard). Returns None when no CA is
+        configured, meaning no attestation layer exists (relay-side
+        registration grants still bound claims in that deployment).
+        """
+        if self.enterprise_ca is None:
+            return None
+        if not isinstance(frame.data, dict) or "_caller_manifest" not in frame.data:
+            return 0
+        try:
+            sm = SignedManifest.from_dict(frame.data["_caller_manifest"])
+        except Exception as e:
+            logger.warning(f"malformed caller manifest from {frame.sender_pin}: {e}")
+            return 0
+        if not sm.is_valid(trusted_ca_public_bytes=self.enterprise_ca.public_bytes):
+            return 0
+        if sm.manifest.pin != frame.sender_pin:
+            return 0
+        pub = sm.manifest.public_bytes
+        if not pub or compute_pin(pub) != frame.sender_pin:
+            return 0
+        return int(sm.manifest.allowed_capabilities)
+
     async def _dispatch_handler(self, frame: EacpFrame) -> None:
-        """Invokes handler with PlatSec enforcement, hop limit and token budget escrow."""
-        handler = self._action_handlers.get(frame.verb)
-        if not handler:
-            await self.reply(frame, status=EacpError.EACP_ERR_MALFORMED_FRAME)
-            return
-
-        # Execution constraints check (max_depth_hops)
-        if frame.constraints and frame.constraints.max_depth_hops <= 0:
-            await self.reply(
-                frame,
-                status=EacpError.EACP_ERR_DEPTH_EXCEEDED,
-                result_data={"error": "EACP execution depth exceeded (max_depth_hops reached 0)"},
-            )
-            return
-
-        # PlatSec capability check
-        allowed, err_code = self.gate.evaluate(frame.capabilities_mask, frame.verb)
-        if not allowed:
-            await self.reply(frame, status=err_code, result_data={"error": "PlatSec capability denied"})
-            return
-
-        # --- Token budget lifecycle (kernel escrow discipline) -------------
-        # Escrow happens BEFORE any work: an over-budget request is refused
-        # without spending a single unit of compute (fail-closed).
-        budget = frame.constraints.token_budget if frame.constraints else 0
+        """Request registry entry point: bounded concurrency (semaphore),
+        PlatSec three-layer authorization, hop limit, token escrow with a
+        PRE-dispatch estimate, cancellation, and guaranteed cleanup."""
+        key = (frame.sender_pin, frame.transaction_id)
+        escrowed = False
+        span_start = time.perf_counter()
+        trace = None
+        if isinstance(frame.data, dict) and isinstance(frame.data.get("_trace"), str):
+            trace = TraceContext.parse(frame.data["_trace"])
         try:
-            self.ledger.escrow(frame.transaction_id, budget)
-        except BudgetError as esc_err:
-            await self.reply(
-                frame,
-                status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
-                result_data={"error": "budget escrow refused", "detail": esc_err.detail},
-            )
-            return
+            async with self._semaphore():
+                handler = self._action_handlers.get(frame.verb)
+                if not handler:
+                    await self.reply(frame, status=EacpError.EACP_ERR_MALFORMED_FRAME)
+                    return
 
-        try:
-            res = handler(frame)
-            if inspect.iscoroutine(res):
-                res = await res
-            usage = int(self.token_meter.measure(frame, res))
+                # Execution constraints check (max_depth_hops)
+                if frame.constraints and frame.constraints.max_depth_hops <= 0:
+                    await self.reply(
+                        frame,
+                        status=EacpError.EACP_ERR_DEPTH_EXCEEDED,
+                        result_data={"error": "EACP execution depth exceeded (max_depth_hops reached 0)"},
+                    )
+                    return
+
+                # PlatSec capability check — three layers: authenticated
+                # caller grants (CA mode), the request's attenuation, and
+                # this agent's own policy
+                caller_grants = self._caller_grants(frame)
+                if caller_grants is not None and (frame.capabilities_mask & ~caller_grants):
+                    await self.reply(
+                        frame,
+                        status=EacpError.EACP_ERR_CAPABILITY_DENIED,
+                        result_data={
+                            "error": "claimed capabilities exceed the caller's CA-attested grants "
+                            "(delegated permissions may only decrease)"
+                        },
+                    )
+                    return
+                allowed, err_code = self.gate.evaluate(
+                    frame.capabilities_mask, frame.verb, caller_grants=caller_grants
+                )
+                if not allowed:
+                    await self.reply(frame, status=err_code, result_data={"error": "PlatSec capability denied"})
+                    return
+
+                # --- Token budget lifecycle (kernel escrow discipline) -------------
+                # Escrow happens BEFORE any work: an over-budget request is refused
+                # without spending a single unit of compute (fail-closed).
+                budget = frame.constraints.token_budget if frame.constraints else 0
+                try:
+                    self.ledger.escrow(frame.transaction_id, budget)
+                    escrowed = True
+                except BudgetError as esc_err:
+                    await self.reply(
+                        frame,
+                        status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                        result_data={"error": "budget escrow refused", "detail": esc_err.detail},
+                    )
+                    return
+
+                # Pre-dispatch estimate: refuse a request whose OWN payload
+                # already exceeds the envelope, before the handler runs
+                # (a post-hoc measure alone cannot prevent the spend).
+                pre = 0
+                est_fn = getattr(self.token_meter, "estimate_request", None)
+                if est_fn is not None and budget != 0:
+                    pre = int(est_fn(frame))
+                    if pre:
+                        try:
+                            self.ledger.consume(frame.transaction_id, pre)
+                        except BudgetError as pre_err:
+                            self.ledger.refund(frame.transaction_id)
+                            escrowed = False
+                            await self.reply(
+                                frame,
+                                status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                                result_data={
+                                    "error": "request payload alone exceeds the token envelope "
+                                    "(refused before handler execution)",
+                                    "detail": pre_err.detail,
+                                },
+                            )
+                            return
+
+                try:
+                    res = handler(frame)
+                    if inspect.iscoroutine(res):
+                        res = await res
+                    total = int(self.token_meter.measure(frame, res))
+                    usage = total - pre if pre else total
+                    if usage > 0:
+                        try:
+                            self.ledger.consume(frame.transaction_id, usage)
+                        except BudgetError as over_err:
+                            self.ledger.refund(frame.transaction_id)
+                            escrowed = False
+                            await self.reply(
+                                frame,
+                                status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                                result_data={"error": "token budget overflow", "detail": over_err.detail},
+                            )
+                            return
+                    remaining = self.ledger.commit(frame.transaction_id)
+                    escrowed = False
+                    logger.debug(
+                        "span=handler verb=%s tx=%d trace=%s ms=%.3f",
+                        frame.verb,
+                        frame.transaction_id,
+                        trace.trace_id if trace else "-",
+                        (time.perf_counter() - span_start) * 1000.0,
+                    )
+                    await self.reply(frame, status=EacpError.EACP_SUCCESS, result_data=res, remaining_budget=remaining)
+                except BudgetError as bud_err:
+                    # Handler itself hit the envelope (e.g. via spend_tokens): refund + overflow reply
+                    self.ledger.refund(frame.transaction_id)
+                    escrowed = False
+                    await self.reply(
+                        frame,
+                        status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
+                        result_data={"error": "token budget overflow", "detail": bud_err.detail},
+                    )
+                except Exception as exc:
+                    self.ledger.refund(frame.transaction_id)
+                    escrowed = False
+                    logger.error(f"Error executing action {frame.verb}: {exc}", exc_info=True)
+                    await self.reply(frame, status=EacpError.EACP_ERR_CANCELLED, result_data={"error": str(exc)})
+        except asyncio.CancelledError:
+            # Cancellation (caller timeout -> PULSE_CANCEL): refund the
+            # escrow deterministically and answer best-effort. The HANDLER
+            # coroutine is cancelled at its await point — work does not
+            # continue after the timeout. External side effects already
+            # performed need their own compensation (cleanup != rollback of
+            # the outside world; see ARCHITECTURE).
+            if escrowed:
+                self._safe_refund(frame.transaction_id)
+                escrowed = False
+            logger.debug(
+                "handler cancelled verb=%s tx=%d ms=%.3f",
+                frame.verb,
+                frame.transaction_id,
+                (time.perf_counter() - span_start) * 1000.0,
+            )
             try:
-                self.ledger.consume(frame.transaction_id, usage)
-                remaining = self.ledger.commit(frame.transaction_id)
-            except BudgetError as over_err:
-                self.ledger.refund(frame.transaction_id)
                 await self.reply(
                     frame,
-                    status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
-                    result_data={"error": "token budget overflow", "detail": over_err.detail},
+                    status=EacpError.EACP_ERR_CANCELLED,
+                    result_data={"error": "handler cancelled after caller timeout"},
                 )
-                return
-            await self.reply(frame, status=EacpError.EACP_SUCCESS, result_data=res, remaining_budget=remaining)
-        except BudgetError as bud_err:
-            # Handler itself hit the envelope (e.g. via spend_tokens): refund + overflow reply
-            self.ledger.refund(frame.transaction_id)
-            await self.reply(
-                frame,
-                status=EacpError.EACP_ERR_TOKEN_OVERFLOW,
-                result_data={"error": "token budget overflow", "detail": bud_err.detail},
-            )
-        except Exception as exc:
-            self.ledger.refund(frame.transaction_id)
-            logger.error(f"Error executing action {frame.verb}: {exc}", exc_info=True)
-            await self.reply(frame, status=EacpError.EACP_ERR_CANCELLED, result_data={"error": str(exc)})
+            except Exception:
+                pass
+            raise
+        finally:
+            self._inflight.pop(key, None)
+            if escrowed:
+                self._safe_refund(frame.transaction_id)
 
     async def close(self) -> None:
-        """Closes client session."""
+        """Closes client session (and cancels every in-flight handler —
+        disconnect cleanup: no handler outlives its connection)."""
         self._connected = False
+        for task in list(self._inflight.values()):
+            task.cancel()
+        self._inflight.clear()
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
         if self._pump_task and not self._pump_task.done():

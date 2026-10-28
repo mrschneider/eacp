@@ -163,7 +163,25 @@ class PlatSecGate:
     def get_tool_requirements(self, action: str) -> Optional[Capability]:
         return self._tool_registry.get(action)
 
-    def evaluate(self, frame_capabilities: int, action: str) -> Tuple[bool, int]:
+    def evaluate(
+        self,
+        frame_capabilities: int,
+        action: str,
+        caller_grants: Optional[int] = None,
+    ) -> Tuple[bool, int]:
+        """Three-layer authorization (fail-closed on every layer):
+
+        1. `caller_grants` — the AUTHENTICATED caller's CA-attested grants
+           (None only when no caller attestation is available: relay-side
+           registration bounds claims in that case; with a configured CA the
+           receiver passes 0 for a caller that presented no valid manifest).
+        2. `frame_capabilities` — the request's attenuated permission
+           (the caller may ask for LESS than it holds, never more).
+        3. `self.manifest.allowed_capabilities` — the target's own policy.
+
+        effective = caller_grants & claimed & target_policy; the tool's
+        required bits must be a subset of effective.
+        """
         required = self.get_tool_requirements(action)
         if required is None:
             if self.strict_mode:
@@ -173,15 +191,23 @@ class PlatSecGate:
         if required == Capability.NONE:
             return True, EacpError.EACP_SUCCESS
 
-        granted = (frame_capabilities & int(self.manifest.allowed_capabilities))
-        if (granted & int(required)) != int(required):
+        effective = frame_capabilities
+        if caller_grants is not None:
+            effective &= caller_grants
+        effective &= int(self.manifest.allowed_capabilities)
+        if (effective & int(required)) != int(required):
             return False, EacpError.EACP_ERR_CAPABILITY_DENIED
 
         return True, EacpError.EACP_SUCCESS
 
-    def check_or_raise(self, frame: EacpFrame, action: Optional[str] = None) -> None:
+    def check_or_raise(
+        self,
+        frame: EacpFrame,
+        action: Optional[str] = None,
+        caller_grants: Optional[int] = None,
+    ) -> None:
         act = action if action is not None else frame.verb
-        allowed, err = self.evaluate(frame.capabilities_mask, act)
+        allowed, err = self.evaluate(frame.capabilities_mask, act, caller_grants=caller_grants)
         if not allowed:
             required = self.get_tool_requirements(act)
             raise PlatSecException(
@@ -206,15 +232,52 @@ class SignedManifest:
         pub = self.manifest.public_bytes or b""
         return f"{self.manifest.pin}|{int(self.manifest.allowed_capabilities)}|{self.expires_at:.2f}|".encode("utf-8") + pub
 
-    def is_valid(self) -> bool:
+    def is_valid(self, trusted_ca_public_bytes: Optional[bytes] = None) -> bool:
+        """Verifies the CA signature.
+
+        `trusted_ca_public_bytes` is the CA key CONFIGURED BY THE VERIFIER
+        (e.g. the relay's `EnterpriseCA.public_bytes`). When given, the
+        signature is checked against *that* key — never against
+        `ca_public_bytes` carried inside the submitted manifest, which an
+        attacker controls (a manifest signed by an unrelated CA with a
+        spoofed `ca_pin` must not pass). Without a trusted key this method
+        retains its legacy self-consistent check and callers should not
+        treat the result as an authenticated attestation.
+        """
         if time.time() > self.expires_at:
             return False
+        key_bytes = trusted_ca_public_bytes if trusted_ca_public_bytes is not None else self.ca_public_bytes
         try:
-            ca_pub = ed25519.Ed25519PublicKey.from_public_bytes(self.ca_public_bytes)
+            ca_pub = ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
             ca_pub.verify(self.signature, self.canonical_bytes())
             return True
         except Exception:
             return False
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "SignedManifest":
+        return cls(
+            manifest=SecurityManifest(
+                pin=d["pin"],
+                allowed_capabilities=Capability(d["allowed_capabilities"]),
+                public_bytes=bytes.fromhex(d["public_bytes"]) if d.get("public_bytes") else None,
+            ),
+            ca_pin=d["ca_pin"],
+            ca_public_bytes=bytes.fromhex(d["ca_public_bytes"]),
+            signature=bytes.fromhex(d["signature"]),
+            expires_at=d["expires_at"],
+        )
+
+    def to_dict(self) -> Dict:
+        return {
+            "pin": self.manifest.pin,
+            "allowed_capabilities": int(self.manifest.allowed_capabilities),
+            "public_bytes": (self.manifest.public_bytes or b"").hex(),
+            "ca_pin": self.ca_pin,
+            "ca_public_bytes": self.ca_public_bytes.hex(),
+            "signature": self.signature.hex(),
+            "expires_at": self.expires_at,
+        }
 
 
 class EnterpriseCA:
@@ -289,12 +352,24 @@ def create_client_ssl_context(
     ca_certfile: Optional[str] = None,
     verify_server: bool = True,
 ) -> ssl.SSLContext:
-    """Configures TLS 1.3 / mTLS client context for enterprise agents."""
+    """Configures TLS 1.3 / mTLS client context for enterprise agents.
+
+    Secure by default: `verify_server=True` (the default) always verifies —
+    against `ca_certfile` when given, otherwise against the system trust
+    store. Disabling verification requires the EXPLICIT
+    `verify_server=False` development opt-out; it is never triggered by
+    merely omitting a CA file.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    if ca_certfile and verify_server:
-        ctx.load_verify_locations(cafile=ca_certfile)
+    if verify_server:
+        if ca_certfile:
+            ctx.load_verify_locations(cafile=ca_certfile)
+        else:
+            ctx.load_default_certs()
         ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = True
     else:
+        # explicit development opt-out — never the default path
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 

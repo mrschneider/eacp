@@ -35,6 +35,11 @@ pub struct RelayState {
     pub config: RelayConfig,
     /// Maps Agent-PIN -> transmission channel to its active socket task
     routes: RwLock<HashMap<u64, mpsc::Sender<Bytes>>>,
+    /// Authenticated DECLARED capability mask per registered Agent-PIN:
+    /// claimed capabilities on MsgSend must fit inside it (mirrors the
+    /// Python relay's registration-grants gate; full CA/signature
+    /// verification is a documented Rust qualification gap)
+    grants: RwLock<HashMap<u64, u64>>,
     /// Last activity timestamp per Agent-PIN
     last_seen: RwLock<HashMap<u64, Instant>>,
     /// QNX Neutrino-style rendezvous deadlock graph
@@ -48,6 +53,7 @@ impl RelayState {
         Self {
             config,
             routes: RwLock::new(HashMap::new()),
+            grants: RwLock::new(HashMap::new()),
             last_seen: RwLock::new(HashMap::new()),
             deadlock: Mutex::new(DeadlockGraph::new()),
             push_queues: Mutex::new(HashMap::new()),
@@ -58,16 +64,21 @@ impl RelayState {
         &self,
         pin: u64,
         sender: mpsc::Sender<Bytes>,
+        declared_capabilities: u64,
     ) {
         {
             let mut routes = self.routes.write().await;
             routes.insert(pin, sender.clone());
         }
         {
+            let mut grants = self.grants.write().await;
+            grants.insert(pin, declared_capabilities);
+        }
+        {
             let mut ls = self.last_seen.write().await;
             ls.insert(pin, Instant::now());
         }
-        info!(pin = format!("0x{:016X}", pin), "Agent registered");
+        info!(pin = format!("0x{:016X}", pin), capabilities = declared_capabilities, "Agent registered");
 
         // Drain offline push queue for this agent respecting TTL
         let queued_frames = {
@@ -92,6 +103,10 @@ impl RelayState {
         {
             let mut routes = self.routes.write().await;
             routes.remove(&pin);
+        }
+        {
+            let mut grants = self.grants.write().await;
+            grants.remove(&pin);
         }
         {
             let mut ls = self.last_seen.write().await;
@@ -196,7 +211,7 @@ pub async fn handle_connection<S>(
         {
             let pin = frame.header.sender_pin;
             registered_pin = Some(pin);
-            state.register_agent(pin, tx.clone()).await;
+            state.register_agent(pin, tx.clone(), frame.header.capabilities_mask).await;
 
             // Send registration ACK reply
             let ack = frame.create_reply(
@@ -225,15 +240,45 @@ pub async fn handle_connection<S>(
                 }
                 if code == pulse_code::PULSE_CANCEL {
                     let mut dl = state.deadlock.lock().await;
-                    dl.remove_dependency(frame.header.sender_pin);
+                    dl.remove_dependency(frame.header.sender_pin, Some(frame.header.transaction_id));
                 }
             }
         }
 
         // 3. Rendezvous & Deadlock cycle detection
         if frame.header.msg_type == MsgType::MsgSend as u8 {
+            // Authorization: claimed capabilities must fit the DECLARED
+            // registration mask (defense at the trust anchor — the Rust
+            // relay does not yet verify CA-signed manifests; see the
+            // qualification gaps in ARCHITECTURE.md)
+            let declared = {
+                let grants = state.grants.read().await;
+                grants.get(&frame.header.sender_pin).copied()
+            };
+            if let Some(allowed) = declared {
+                if frame.header.capabilities_mask & !allowed != 0 {
+                    warn!(
+                        sender = format!("0x{:016X}", frame.header.sender_pin),
+                        claimed = frame.header.capabilities_mask,
+                        granted = allowed,
+                        "Claimed capabilities exceed registration grants, refusing"
+                    );
+                    let err_reply = frame.create_reply(
+                        error_code::EACP_ERR_CAPABILITY_DENIED,
+                        Some(&serde_json::json!({
+                            "error": "claimed capabilities exceed registration grants"
+                        })),
+                    );
+                    let _ = tx.send(err_reply.to_bytes()).await;
+                    continue;
+                }
+            }
             let mut dl = state.deadlock.lock().await;
-            if !dl.add_dependency(frame.header.sender_pin, frame.header.target_pin) {
+            if !dl.add_dependency(
+                frame.header.sender_pin,
+                frame.header.target_pin,
+                frame.header.transaction_id,
+            ) {
                 // Deadlock detected! Reply immediately with error
                 warn!(
                     sender = format!("0x{:016X}", frame.header.sender_pin),
@@ -246,7 +291,7 @@ pub async fn handle_connection<S>(
             }
         } else if frame.header.msg_type == MsgType::MsgReply as u8 {
             let mut dl = state.deadlock.lock().await;
-            dl.remove_dependency(frame.header.target_pin);
+            dl.remove_dependency(frame.header.target_pin, Some(frame.header.transaction_id));
         }
 
         // 4. Route frame to target
@@ -268,19 +313,38 @@ pub async fn handle_connection<S>(
             if frame.header.is_urgent() {
                 if frame.header.msg_type == MsgType::MsgSend as u8 {
                     let mut dl = state.deadlock.lock().await;
-                    dl.remove_dependency(frame.header.sender_pin);
+                    dl.remove_dependency(frame.header.sender_pin, Some(frame.header.transaction_id));
                     let err_reply = frame.create_reply(error_code::EACP_ERR_UNKNOWN_PIN, None);
                     let _ = tx.send(err_reply.to_bytes()).await;
                 }
             } else {
-                // Buffer in push queue
+                // Buffer in push queue — global budget enforced with an
+                // EXPLICIT refusal (parity with the Python relay: never a
+                // silent drop, and the deadlock edge is released)
                 let timeout_ms = frame.get_timeout_ms();
-                let mut queues = state.push_queues.lock().await;
-                let queue = queues.entry(target_pin).or_insert_with(VecDeque::new);
-                if queue.len() >= state.config.max_push_queue {
-                    queue.pop_front();
+                let full = {
+                    let mut queues = state.push_queues.lock().await;
+                    let queue = queues.entry(target_pin).or_insert_with(VecDeque::new);
+                    if queue.len() >= state.config.max_push_queue {
+                        true
+                    } else {
+                        queue.push_back((Instant::now(), timeout_ms, raw_frame_bytes));
+                        false
+                    }
+                };
+                if full {
+                    if frame.header.msg_type == MsgType::MsgSend as u8 {
+                        let mut dl = state.deadlock.lock().await;
+                        dl.remove_dependency(frame.header.sender_pin, Some(frame.header.transaction_id));
+                        let err_reply = frame.create_reply(
+                            error_code::EACP_ERR_QUEUE_FULL,
+                            Some(&serde_json::json!({
+                                "error": "offline queue budget exceeded"
+                            })),
+                        );
+                        let _ = tx.send(err_reply.to_bytes()).await;
+                    }
                 }
-                queue.push_back((Instant::now(), timeout_ms, raw_frame_bytes));
             }
         }
     }

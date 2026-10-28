@@ -18,7 +18,7 @@ Modern multi-agent architectures (CrewAI, AutoGen, LangGraph, Swarm) suffer from
 ### 1.2 The Microkernel Pedigree
 EACP solves multi-agent coordination by importing proven primitives from battle-tested microkernel operating systems:
 * **Cooperative Event-Loop & Capability Architecture:**
-  * *Active Objects & Active Scheduler:* Non-preemptive, cooperative FSM concurrency within a single thread. Eliminates locking contention and guarantees deterministic cancellation.
+  * *Active Objects & Active Scheduler:* Non-preemptive, cooperative FSM concurrency within a single thread. Eliminates locking contention in the dispatch loop; cancellation is cooperative (tasks stop at their await points), not preemptive-deterministic.
   * *Client-Server Architecture (`RMessage2` / `RSessionBase`):* Strict IPC message slots (`TIpcArgs`) separating verb, arguments, constraints, and context.
   * *Platform Security (PlatSec):* Fine-grained, bitmask-enforced capabilities required for any IPC dispatch.
   * *CleanupStack & Two-Phase Construction:* Automatic resource recovery and state rollback upon execution failure.
@@ -256,14 +256,25 @@ The **EACP-Relay** functions as an enterprise push router and rendezvous broker:
 ### 8.1 Responsibilities
 * **Presence & Routing:** Maintains an in-memory lookup table of active Agent-PINs and transport connections.
 * **Offline Buffering (Push):** If a target agent temporarily drops connection (e.g. edge pod restart), non-urgent messages are held in a bounded push queue until reconnection or TTL expiration.
-* **Transit PlatSec Check:** The Relay validates frame digital signatures before routing, dropping spoofed packets at the boundary.
+* **Transit PlatSec Check:** The Relay validates frame digital signatures before routing, dropping spoofed packets at the boundary (Python relay; the Rust relay does not yet verify signatures — see §8.3), enforces registration grants on claimed capabilities, and refuses replayed transactions.
 
 ### 8.2 Native Rust Implementation (`crates/eacp-relay`)
-To guarantee sub-millisecond p99 latency without garbage-collection jitter (essential for strict QoS deadlines), the EACP-Relay provides a high-performance native implementation in Rust (`crates/eacp-relay`):
+To target sub-millisecond p99 latency without garbage-collection jitter (essential for strict QoS deadlines; the figure itself is still unbenchmarked — see §8.3), the EACP-Relay provides a high-performance native implementation in Rust (`crates/eacp-relay`):
 * **Tokio Async Engine:** High-concurrency non-blocking event loop across multi-core systems.
-* **Zero-Copy Parsing:** Big-endian 48-byte header and slot boundaries parsed directly off socket buffers without intermediate heap copies.
-* **Deadlock Graph in Rust:** Cycle-detection graph with instant lock-free lookups and automatic dependency unwinding on agent disconnect or cancel pulse.
-* **Small Footprint:** Single ~2.2 MB binary consuming < 15 MB RAM under tens of thousands of concurrent agent sessions.
+* **Binary Parsing:** Big-endian 48-byte header and slot boundaries are parsed off the socket buffer; the payload is read into one owned buffer (one allocation per frame — not zero-copy).
+* **Deadlock Graph in Rust:** Cycle-detection graph with in-memory lookups (RwLock/Mutex-guarded — not lock-free), per-transaction edges, and automatic dependency unwinding on agent disconnect or cancel pulse.
+* **Small Footprint:** Single ~2.2 MB release binary; per-session memory figures are unbenchmarked.
+
+### 8.3 Rust Relay qualification gaps
+The Rust relay is a performance candidate, not yet a security-equivalent production replacement for the Python reference relay. Current gaps, tracked for the qualification cycle:
+
+* **No CA/manifest signature verification** — registration accepts the sender's declared PIN and capability mask. Defense today is the declared-grants gate (`claimed ⊆ registered mask` on `MsgSend`); full CA-signed-manifest + proof-of-possession verification exists only in the Python relay.
+* **No TLS listener, no audit ledger, no mesh peering, no telemetry** — these subsystems exist only on the Python relay.
+* **No replay protection** — without signature verification there is no per-sender authenticity to bind seen transactions to.
+* **Performance claims unbenchmarked** — p99 latency, session-scale memory and "lock-free/zero-copy" wording were removed until reproducible benchmarks exist.
+* CI now has an **interop job**: builds the Rust binary, runs the full Python suite with it present, and fails if any test is skipped.
+
+Mesh (§8.1), QoS RxO contracts and DTN are **experimental extensions**: unit-tested, not yet validated in multi-relay production scenarios.
 
 
 ---
@@ -314,7 +325,7 @@ Full per-file map of the repository (kept here so the README stays lean):
 ├── crates/
 │   └── eacp-relay/          # High-performance native Rust microkernel relay daemon
 │       ├── Cargo.toml
-│       └── src/             # Tokio async event loop, zero-copy wire parser, deadlock engine
+│       └── src/             # Tokio async event loop, binary wire parser, deadlock engine
 ├── src/
 │   └── eacp/
 │       ├── __init__.py      # Package export

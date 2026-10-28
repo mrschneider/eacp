@@ -77,6 +77,17 @@ class PayloadTokenMeter:
             res = 0
         return (req + res + 3) // 4
 
+    def estimate_request(self, frame: EacpFrame) -> int:
+        """PRE-dispatch half of `measure`: the request payload alone. The
+        dispatcher consumes this BEFORE running the handler, so a request
+        whose payload already exceeds the envelope is refused without any
+        handler execution (a post-hoc measure cannot prevent that spend)."""
+        try:
+            req = len(json.dumps(frame.data or {}).encode("utf-8"))
+        except (TypeError, ValueError):
+            req = 0
+        return (req + 3) // 4
+
 
 @dataclass
 class EscrowEntry:
@@ -195,10 +206,25 @@ def create_downstream_constraints(
     Builds the child constraints for a downstream MsgSend issued inside a
     handler: the budget envelope shrinks by the parent's own usage and the
     hop count decrements, so the whole delegation tree shares one envelope.
+
+    Exhausted is NOT unlimited: `token_budget == 0` means an explicitly
+    UNCONSTRAINED envelope, but a constrained envelope whose remaining
+    amount hit 0 must refuse to delegate — producing a child with budget 0
+    there silently converted an exhausted parent into an unlimited child
+    (the delegation escape bug). Raises BudgetError in that case.
     """
     parent = frame.constraints
     parent_budget = parent.token_budget if parent else UNLIMITED_BUDGET
-    child_budget = UNLIMITED_BUDGET if parent_budget == UNLIMITED_BUDGET else max(0, parent_budget - parent_usage)
+    if parent_budget != UNLIMITED_BUDGET:
+        remaining = parent_budget - parent_usage
+        if remaining <= 0:
+            raise BudgetError(
+                f"cannot delegate an exhausted envelope: budget {parent_budget} spent {parent_usage} "
+                f"(0 means unlimited only for envelopes that STARTED unconstrained)"
+            )
+        child_budget = remaining
+    else:
+        child_budget = UNLIMITED_BUDGET
     return ExecutionConstraints(
         token_budget=child_budget,
         timeout_ms=timeout_ms if timeout_ms is not None else (parent.timeout_ms if parent else 30_000),

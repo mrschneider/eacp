@@ -79,6 +79,8 @@ class EacpError(IntEnum):
     EACP_ERR_MALFORMED_FRAME = 9
     EACP_ERR_DISCONNECTED = 10
     EACP_ERR_DEPTH_EXCEEDED = 11
+    EACP_ERR_REPLAY_DETECTED = 12
+    EACP_ERR_QUEUE_FULL = 13
 
 
 class RequestStatus(IntEnum):

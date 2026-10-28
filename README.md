@@ -64,15 +64,23 @@ verifiable.
 
 - **Prompt injection cannot escalate privileges** — PlatSec validation
   happens at the L2 protocol layer, before any LLM inference or tool
-  invocation.
-- **Circular deadlocks are impossible** — the relay's `DeadlockGraph`
-  rejects `MsgSend` cycles with `EACP_ERR_DEADLOCK_DETECTED`.
-- **No zombie routes** — offline push queues respect per-message TTL;
-  heartbeat timeouts prune dead transports.
-- **Deterministic rollback** — `CleanupStack` guarantees resource recovery
-  when `RunL()` leaves.
-- **Non-repudiation** — every routed frame produces a hash-chained audit
-  ledger entry.
+  invocation, and claimed capabilities are checked against the caller's
+  CA-attested registration grants (delegated permissions may only
+  decrease).
+- **Circular deadlocks are refused** — the relay's `DeadlockGraph`
+  rejects `MsgSend` cycles with `EACP_ERR_DEADLOCK_DETECTED` (edges are
+  tracked per transaction, so concurrent calls cannot mask a cycle).
+- **No zombie routes** — offline push queues respect per-message TTL and a
+  global byte/frame budget with an explicit `EACP_ERR_QUEUE_FULL`
+  refusal; heartbeat timeouts prune dead transports.
+- **Deterministic resource cleanup** — `CleanupStack` releases protocol
+  resources when `RunL()` leaves; reversing external side effects (API
+  calls, database writes) remains the application's compensation or
+  idempotency strategy.
+- **Tamper-evident audit trail** — routed frames append to a hash-chained
+  ledger that is recovered and verified across restarts (a hash chain is
+  a mechanism, not legal non-repudiation or a SOC 2 / ISO 27001
+  certification — those require external controls).
 - **Language-portable by construction** — the wire contract is pinned by
   `conformance/`: byte-exact vectors any Scala/Rust/Go implementation must
   satisfy to join the mesh, enforced by CI on every push.
@@ -83,21 +91,21 @@ verifiable.
 |---|---|---|
 | Zero-Trust Encryption | `security.py` | AES-256-GCM payload confidentiality + mTLS/TLS 1.3 transport contexts |
 | Observability | `telemetry.py` | W3C TraceContext distributed tracing + Prometheus/OpenMetrics exporter |
-| Agent PKI | `security.py` | `EnterpriseCA` signs `SignedManifest`s; relay rejects rogue key registration |
-| High Availability | `mesh.py` | Multi-Relay peer mesh routing across clouds/AZs/edges (no SPOF) |
-| Audit Compliance | `ledger.py` | Append-only SHA-256 chained WAL ledger (SOC2 / ISO 27001, tamper-evident) |
-| DoS Protection | `frame.py` | Strict 16 MB payload guard validated before allocation |
+| Agent PKI | `security.py` | `EnterpriseCA` signs `SignedManifest`s; the relay verifies manifests against the CONFIGURED CA key with pin/key binding and proof of private-key possession |
+| High Availability | `mesh.py` | Multi-Relay peer mesh routing across clouds/AZs/edges (experimental — see ARCHITECTURE §8.3) |
+| Audit Trail | `ledger.py` | Append-only SHA-256 chained WAL ledger with startup recovery, chain verification and rotation (tamper-evident mechanism — not a compliance certification) |
+| DoS Protection | `frame.py` | Strict 16 MB payload guard plus bounded decompression (wire and decompressed representations are both capped) |
 | Wire Compression | `frame.py` | Transparent zlib compression of payloads > 1 KB (`FLAG_COMPRESSED`) |
 | Keepalive | `relay.py` | `PULSE_HEARTBEAT` presence + dead-route reaper (3x missed → prune) |
 | Hop Guard | `client.py` | `max_depth_hops` decremental enforcement prevents infinite agent delegation |
 | Token Budget Escrow | `budget.py` | Kernel-style escrow/settle/refund ledger with pluggable `TokenMeter`, ledger capacity and `EACP_ERR_TOKEN_OVERFLOW` |
 | Fail-Closed PlatSec | `security.py` | `strict_mode=True` rejects any action not registered in the manifest |
-| DDS C4I QoS Contract | `qos.py` | Requested vs Offered (RxO) contract validation + exclusive ownership arbitration with failover |
-| DTN Store-and-Forward | `dtn.py` | RFC 9171 / DARPA Bundle Protocol custody transfer, duplicate suppression & hop limits |
+| DDS C4I QoS Contract | `qos.py` | Requested vs Offered (RxO) contract validation + exclusive ownership arbitration with failover (experimental) |
+| DTN Store-and-Forward | `dtn.py` | RFC 9171 / DARPA Bundle Protocol custody transfer, duplicate suppression & hop limits (experimental) |
 
 ## Quickstart
 
-Run the test suite (56 tests):
+Run the test suite (84 tests):
 
 ```bash
 python3 -m unittest discover tests -v
@@ -143,11 +151,11 @@ asyncio.run(main())
 ```
 ARCHITECTURE.md     canonical protocol reference (wire format, PlatSec, scheduler, relay)
 conformance/        cross-language wire contract: vectors + generator + strict verifier
-crates/eacp-relay/  native Rust relay daemon (tokio, zero-copy parser, deadlock engine)
+crates/eacp-relay/  native Rust relay daemon (tokio, binary parser, deadlock engine)
 src/eacp/           protocol core: frame · security · scheduler · primitives · relay ·
                     client · telemetry · ledger · mesh · budget · qos · dtn
-tests/              8 suites: frame · security · scheduler · relay · budget ·
-                    enterprise · tactical · rust_relay
+tests/              9 suites: frame · security · scheduler · relay · budget ·
+                    enterprise · tactical · rust_relay · protocol_hardening
 docs/               architecture diagram
 ```
 

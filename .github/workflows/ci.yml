@@ -74,3 +74,41 @@ jobs:
       - name: Build release binary
         run: cargo build --release --manifest-path crates/eacp-relay/Cargo.toml
 
+  interop:
+    # The analysis's CI correction: building the Rust relay in a SEPARATE
+    # job while the Python job skips the interop tests when the binary is
+    # absent left Python<->Rust never actually exercised together. This job
+    # builds Rust first, then runs the FULL Python suite with the binary
+    # present, and FAILS if any test was skipped (no silent green).
+    name: Python <-> Rust interop (no skips)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust relay (release)
+        run: cargo build --release --manifest-path crates/eacp-relay/Cargo.toml
+      - name: Verify interop binary exists
+        run: test -x crates/eacp-relay/target/release/eacp-relay
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install cryptography
+      - name: Run full suite with the Rust binary present
+        run: |
+          set -o pipefail
+          python -m unittest discover tests -v 2>&1 | tee suite.log
+          if grep -qi "skipped" suite.log; then
+            echo "::error::Interop tests were SKIPPED with the Rust binary present"
+            exit 1
+          fi
+      - name: Conformance vectors
+        run: |
+          python conformance/generate.py
+          python conformance/verify.py
+
