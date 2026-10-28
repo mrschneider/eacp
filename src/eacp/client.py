@@ -723,7 +723,12 @@ class RSessionBase:
         if self.writer:
             try:
                 self.writer.close()
-                await self.writer.wait_closed()
+                # Windows Proactor: wait_closed() can hang forever when the
+                # peer transport never completes its own close (observed in
+                # CI: the connection_lost callback simply never fires). A
+                # close that does not confirm in 2s is still a close — the
+                # sockets are abandoned either way; never hang the caller.
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
             except Exception:
                 pass
         self.writer = None
