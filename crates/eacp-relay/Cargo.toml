@@ -13,7 +13,7 @@ serde_json = "1.0"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 sha2 = "0.10"
 
 # Native relay ships from CI on every tag: thin LTO crosses the

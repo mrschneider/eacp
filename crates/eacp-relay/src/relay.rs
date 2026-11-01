@@ -323,23 +323,38 @@ pub async fn handle_connection<S>(
                 let keys = state.verifier_keys.read().await;
                 keys.get(&frame.header.sender_pin).copied()
             };
-            let mut refused: Option<u32> = None;
-            match key {
-                Some(pk) if frame.verify_sender_signature(&pk) => {
-                    let k = (frame.header.transaction_id, frame.header.target_pin);
-                    if seen_tx.contains(&k) {
-                        refused = Some(error_code::EACP_ERR_REPLAY_DETECTED);
-                    } else {
-                        if seen_order.len() >= REPLAY_WINDOW {
-                            if let Some(old) = seen_order.pop_front() {
-                                seen_tx.remove(&old);
-                            }
-                        }
-                        seen_order.push_back(k);
-                        seen_tx.insert(k);
+            // CPU-bound Ed25519 verify runs on the blocking pool (multi-core),
+            // NOT on the event loop. With pipelined traffic the pure-Rust
+            // verify (~100µs/frame) saturated the single event-loop thread and
+            // descheduled the reader task (read max ~56ms). Awaiting a
+            // spawn_blocking yields the loop, so readers keep draining frames
+            // while verify runs concurrently on the blocking pool.
+            let sig_ok = match key {
+                Some(pk) => {
+                    let f = frame.clone();
+                    match tokio::task::spawn_blocking(move || f.verify_sender_signature(&pk)).await {
+                        Ok(ok) => ok,
+                        Err(_) => false, // blocking task panicked — refuse
                     }
                 }
-                _ => refused = Some(error_code::EACP_ERR_SIGNATURE_INVALID),
+                None => false,
+            };
+            let mut refused: Option<u32> = None;
+            if sig_ok {
+                let k = (frame.header.transaction_id, frame.header.target_pin);
+                if seen_tx.contains(&k) {
+                    refused = Some(error_code::EACP_ERR_REPLAY_DETECTED);
+                } else {
+                    if seen_order.len() >= REPLAY_WINDOW {
+                        if let Some(old) = seen_order.pop_front() {
+                            seen_tx.remove(&old);
+                        }
+                    }
+                    seen_order.push_back(k);
+                    seen_tx.insert(k);
+                }
+            } else {
+                refused = Some(error_code::EACP_ERR_SIGNATURE_INVALID);
             }
             if let Some(code) = refused {
                 warn!(
