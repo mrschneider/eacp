@@ -1,6 +1,6 @@
 [package]
 name = "eacp-relay"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 authors = ["Architecture Team / Infrastructure Operations"]
 description = "High-performance microkernel push relay daemon for EACP written in Rust"

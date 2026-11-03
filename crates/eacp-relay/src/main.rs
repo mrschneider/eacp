@@ -83,6 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
+                    // Protocol frames are latency-sensitive; avoid Nagle /
+                    // delayed-ACK stalls when many small replies are pipelined.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        error!("Unable to configure TCP_NODELAY: {}", e);
+                        continue;
+                    }
                     info!("Incoming connection from {}", peer_addr);
                     tokio::spawn(handle_connection(stream, Arc::clone(&state)));
                 }

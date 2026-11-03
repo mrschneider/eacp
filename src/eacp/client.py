@@ -103,6 +103,7 @@ class RSessionBase:
         
         self._pending_replies: Dict[int, asyncio.Future[EacpFrame]] = {}
         self._incoming_requests: asyncio.Queue[EacpFrame] = asyncio.Queue()
+        self._threaded_handlers: Dict[str, bool] = {}
         self._action_handlers: Dict[str, Callable[..., Any]] = {}
         self._pulse_callbacks: Dict[int, Callable[[int, int], Any]] = {}
         self._connected: bool = False
@@ -124,10 +125,18 @@ class RSessionBase:
         action: str,
         handler: Callable[[EacpFrame], Any],
         required_caps: Capability = Capability.NONE,
+        *,
+        run_in_thread: Optional[bool] = None,
     ) -> None:
-        """Registers an action handler callback with PlatSec protection."""
+        """Register a handler; synchronous callbacks default to worker execution.
+
+        Set run_in_thread=False for callbacks requiring event-loop affinity.
+        """
         self.register_tool(action, required_caps)
         self._action_handlers[action] = handler
+        self._threaded_handlers[action] = (
+            not inspect.iscoroutinefunction(handler) if run_in_thread is None else run_in_thread
+        )
 
     def register_pulse_callback(self, code: int | PulseCode, callback: Callable[[int, int], Any]) -> None:
         self._pulse_callbacks[int(code)] = callback
@@ -171,9 +180,9 @@ class RSessionBase:
             capabilities_mask=int(self.manifest.allowed_capabilities),
             data=reg_data,
         )
-        self.identity.sign_frame(reg_frame)
+        wire = self.identity.pack_frame(reg_frame)
 
-        reply = await self._send_and_await_reply(reg_frame, timeout_ms=5000)
+        reply = await self._send_and_await_reply(reg_frame, timeout_ms=5000, wire=wire)
         if reply.status != EacpError.EACP_SUCCESS:
             await self.close()
             raise RuntimeError(f"Failed to register with EACP Relay: status={reply.status}")
@@ -196,7 +205,7 @@ class RSessionBase:
         except asyncio.CancelledError:
             pass
 
-    async def _send_and_await_reply(self, frame: EacpFrame, timeout_ms: int = 5000) -> EacpFrame:
+    async def _send_and_await_reply(self, frame: EacpFrame, timeout_ms: int = 5000, wire: Optional[bytes] = None) -> EacpFrame:
         if not self._connected or not self.writer:
             raise ConnectionError("RSessionBase is not connected")
 
@@ -204,7 +213,7 @@ class RSessionBase:
         self._pending_replies[frame.transaction_id] = fut
 
         try:
-            data = frame.pack()
+            data = frame.pack() if wire is None else wire
             self.writer.write(data)
             await self.writer.drain()
 
@@ -271,9 +280,9 @@ class RSessionBase:
             data=data,
             constraints=constr,
         )
-        self.identity.sign_frame(frame)
+        wire = self.identity.pack_frame(frame)
 
-        reply = await self._send_and_await_reply(frame, timeout_ms=constr.timeout_ms)
+        reply = await self._send_and_await_reply(frame, timeout_ms=constr.timeout_ms, wire=wire)
         if reply.status != EacpError.EACP_SUCCESS:
             raise EacpRendezvousException(
                 reply.status,
@@ -302,8 +311,7 @@ class RSessionBase:
                 timeout_ms=request_frame.constraints.timeout_ms if request_frame.constraints else 5000,
                 max_depth_hops=request_frame.constraints.max_depth_hops if request_frame.constraints else 10,
             )
-        self.identity.sign_frame(reply_frame)
-        self.writer.write(reply_frame.pack())
+        self.writer.write(self.identity.pack_frame(reply_frame))
         await self.writer.drain()
 
     async def pulse(
@@ -617,9 +625,14 @@ class RSessionBase:
                 # already exceeds the envelope, before the handler runs
                 # (a post-hoc measure alone cannot prevent the spend).
                 pre = 0
+                request_size = None
                 est_fn = getattr(self.token_meter, "estimate_request", None)
                 if est_fn is not None and budget != 0:
-                    pre = int(est_fn(frame))
+                    if type(self.token_meter) is PayloadTokenMeter:
+                        request_size = self.token_meter.request_size(frame)
+                        pre = (request_size + 3) // 4
+                    else:
+                        pre = int(est_fn(frame))
                     if pre:
                         try:
                             self.ledger.consume(key, pre)
@@ -638,10 +651,31 @@ class RSessionBase:
                             return
 
                 try:
-                    res = handler(frame)
-                    if inspect.iscoroutine(res):
+                    if self._threaded_handlers.get(frame.verb, False):
+                        work = asyncio.create_task(asyncio.to_thread(handler, frame))
+                        try:
+                            res = await asyncio.shield(work)
+                        except asyncio.CancelledError:
+                            # Python cannot stop running threads. Hold the handler
+                            # gate and escrow until work actually finishes.
+                            while not work.done():
+                                try:
+                                    await asyncio.shield(work)
+                                except asyncio.CancelledError:
+                                    continue
+                                except Exception:
+                                    break
+                            if not work.cancelled():
+                                work.exception()  # retrieve a late worker failure
+                            raise
+                    else:
+                        res = handler(frame)
+                    if inspect.isawaitable(res):
                         res = await res
-                    total = int(self.token_meter.measure(frame, res))
+                    if request_size is not None:
+                        total = self.token_meter.measure_with_request_size(request_size, res)
+                    else:
+                        total = int(self.token_meter.measure(frame, res))
                     usage = total - pre if pre else total
                     if usage > 0:
                         try:

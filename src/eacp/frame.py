@@ -122,7 +122,17 @@ class EacpFrame:
         val = int.from_bytes(val_bytes, byteorder="big", signed=False)
         return (code, val)
 
-    def pack_slots(self) -> bytes:
+    def _encode_data(self) -> bytes:
+        if self.data is None:
+            return b""
+        elif isinstance(self.data, bytes):
+            return self.data
+        elif isinstance(self.data, (dict, list, int, float, str, bool)):
+            return json.dumps(self.data, separators=(",", ":")).encode("utf-8")
+        else:
+            return str(self.data).encode("utf-8")
+
+    def pack_slots(self, _data_bytes: Optional[bytes] = None) -> bytes:
         """Serializes 4 slots: [lens(4x uint32)] + slot0 + slot1 + slot2 + slot3."""
         if self.is_pulse():
             return self.raw_payload or b"\x00" * 8
@@ -131,14 +141,7 @@ class EacpFrame:
         slot0 = self.verb.encode("utf-8") if self.verb else b""
         
         # Slot 1: Data (JSON or raw bytes)
-        if self.data is None:
-            slot1 = b""
-        elif isinstance(self.data, bytes):
-            slot1 = self.data
-        elif isinstance(self.data, (dict, list, int, float, str, bool)):
-            slot1 = json.dumps(self.data, separators=(",", ":")).encode("utf-8")
-        else:
-            slot1 = str(self.data).encode("utf-8")
+        slot1 = self._encode_data() if _data_bytes is None else _data_bytes
 
         # Slot 2: Execution Constraints
         slot2 = (self.constraints or ExecutionConstraints()).pack()
@@ -200,7 +203,7 @@ class EacpFrame:
 
         return verb, data, constraints, envelope
 
-    def get_signed_bytes(self) -> bytes:
+    def get_signed_bytes(self, _data_bytes: Optional[bytes] = None) -> bytes:
         """
         Returns bytes used for Ed25519 signing/verifying (signing contract
         v2, wire version 2 — SEC-02):
@@ -253,14 +256,7 @@ class EacpFrame:
                     )
                     return hdr + self.raw_payload[:16] + slots_012 + s3_head
         slot0 = self.verb.encode("utf-8") if self.verb else b""
-        if self.data is None:
-            slot1 = b""
-        elif isinstance(self.data, bytes):
-            slot1 = self.data
-        elif isinstance(self.data, (dict, list, int, float, str, bool)):
-            slot1 = json.dumps(self.data, separators=(",", ":")).encode("utf-8")
-        else:
-            slot1 = str(self.data).encode("utf-8")
+        slot1 = self._encode_data() if _data_bytes is None else _data_bytes
         slot2 = (self.constraints or ExecutionConstraints()).pack()
 
         # Header with FLAG_SIGNED ensured; FLAG_COMPRESSED excluded (see
@@ -295,7 +291,7 @@ class EacpFrame:
         # authenticated input — see get_signed_bytes docstring
         return hdr + lens + slot0 + slot1 + slot2 + slot3_prefix
 
-    def pack(self) -> bytes:
+    def pack(self, _data_bytes: Optional[bytes] = None) -> bytes:
         # Fast path: forward the exact wire bytes we were parsed from. This
         # is the relay's dominant per-frame cost (JSON re-encode of the
         # payload slots, ~80-150 us/frame); returning the cache verbatim is
@@ -303,7 +299,7 @@ class EacpFrame:
         # mutation via __setattr__ (tamper detection preserved).
         if self._wire is not None:
             return self._wire
-        payload = self.pack_slots()
+        payload = self.pack_slots(_data_bytes)
         payload_len = len(payload)
         header = HEADER_STRUCT.pack(
             self.magic,

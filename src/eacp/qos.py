@@ -135,6 +135,7 @@ class OwnershipArbitrator:
         self._topics: Dict[str, Dict[int, CandidateRegistration]] = {}
         # topic -> current_owner_pin
         self._active_owners: Dict[str, Optional[int]] = {}
+        self._agent_topics: Dict[int, set[str]] = {}
 
     def register_candidate(
         self,
@@ -153,21 +154,28 @@ class OwnershipArbitrator:
             lease_ms=lease_ms,
             last_heartbeat=t,
         )
+        self._agent_topics.setdefault(agent_pin, set()).add(topic)
         self.evaluate_topic(topic, now=t)
 
     def unregister_candidate(self, topic: str, agent_pin: int, now: Optional[float] = None) -> None:
         t = now if now is not None else time.time()
         if topic in self._topics and agent_pin in self._topics[topic]:
             del self._topics[topic][agent_pin]
+            topics = self._agent_topics.get(agent_pin)
+            if topics is not None:
+                topics.discard(topic)
+                if not topics:
+                    del self._agent_topics[agent_pin]
+            if not self._topics[topic]:
+                del self._topics[topic]
             if self._active_owners.get(topic) == agent_pin:
                 self._active_owners[topic] = None
             self.evaluate_topic(topic, now=t)
 
     def heartbeat(self, agent_pin: int, now: Optional[float] = None) -> None:
         t = now if now is not None else time.time()
-        for candidates in self._topics.values():
-            if agent_pin in candidates:
-                candidates[agent_pin].last_heartbeat = t
+        for topic in self._agent_topics.get(agent_pin, ()):
+            self._topics[topic][agent_pin].last_heartbeat = t
 
     def evaluate_topic(self, topic: str, now: Optional[float] = None) -> Optional[int]:
         """
@@ -180,22 +188,15 @@ class OwnershipArbitrator:
             self._active_owners[topic] = None
             return None
 
-        # Filter candidates whose liveliness lease has not expired
-        live_candidates: List[CandidateRegistration] = []
-        for c in candidates.values():
-            elapsed_ms = (t - c.last_heartbeat) * 1000.0
-            if elapsed_ms <= c.lease_ms:
-                live_candidates.append(c)
-
-        if not live_candidates:
-            self._active_owners[topic] = None
-            return None
-
-        # Sort by strength desc, tie-break by higher agent_pin
-        live_candidates.sort(key=lambda c: (c.strength, c.agent_pin), reverse=True)
-        winner = live_candidates[0].agent_pin
-        self._active_owners[topic] = winner
-        return winner
+        winner = max(
+            (c for c in candidates.values()
+             if (t - c.last_heartbeat) * 1000.0 <= c.lease_ms),
+            key=lambda c: (c.strength, c.agent_pin),
+            default=None,
+        )
+        owner = winner.agent_pin if winner is not None else None
+        self._active_owners[topic] = owner
+        return owner
 
     def get_owner(self, topic: str, now: Optional[float] = None) -> Optional[int]:
         return self.evaluate_topic(topic, now=now)

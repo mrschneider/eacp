@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-11-02
+
+### Changed
+- Run synchronous agent handlers in bounded workers by default, with
+  `run_in_thread=False` for event-loop affinity. Cancellation retains the worker
+  slot and escrow until running work finishes.
+- Add atomic `AgentIdentity.pack_frame()` and use it for client registration,
+  requests, and replies, eliminating duplicate signing/packing JSON encoding
+  without changing wire bytes. Reuse the built-in pre-dispatch request-size
+  estimate, preserving metering formatting and rounding.
+- Bound in-memory audit history (default 10,000 records), stream full-file
+  recovery validation, and serialize async relay audit writes through a bounded
+  dedicated writer while retaining flush/fsync acknowledgements and failure
+  propagation. Expose retention and write-capacity configuration.
+- Index custody expiry with bounded heap cleanup, index ownership heartbeats by
+  agent, and select ownership winners without sorting.
+- Enable TCP_NODELAY in the Rust TCP relay to eliminate pipelined small-frame
+  delayed-ACK stalls without changing signature or replay enforcement.
+
+### Validation and compatibility
+- 121 Python tests, 2 Rust tests, and signing-contract-v2 conformance pass.
+- Rust relay package version is 1.1.1; the EACP release and Python package are
+  2.1.0. Wire version remains 2.
+- Synchronous callbacks now default to worker threads; use `run_in_thread=False`
+  when a callback requires event-loop affinity. Running worker cancellation waits
+  for completion. Audit memory history now defaults to the latest 10,000 entries;
+  configure retention explicitly when a different history policy is needed.
+- Three local Rust pipelined runs measured 3,007–3,440 requests/s, versus about
+  602 before TCP_NODELAY. Atomic signing/packing of a 123 KB frame took about
+  30% less time. Measurements are local loopback results, not capacity guarantees.
+
 ## [2.0.0] — 2026-10-31
 
 ### Breaking

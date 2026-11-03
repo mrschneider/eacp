@@ -15,6 +15,10 @@ index/hash continuity inside the surviving file.
 """
 
 from __future__ import annotations
+import asyncio
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -61,11 +65,25 @@ class AuditLedger:
         file_path: Optional[str] = None,
         fsync_every: int = 50,
         rotate_bytes: int = 64 * 1024 * 1024,
+        max_memory_entries: Optional[int] = 10_000,
+        write_queue_size: int = 256,
     ):
+        if max_memory_entries is not None and max_memory_entries < 0:
+            raise ValueError("max_memory_entries must be non-negative or None")
+        if write_queue_size < 1:
+            raise ValueError("write_queue_size must be positive")
+        self.max_memory_entries = max_memory_entries
+        self._write_queue_size = write_queue_size
+        self._async_slots = None
+        self._executor = None
+        self._lock = threading.RLock()
+        self._failure = None
+        self._closed = False
+        self._async_closing = False
         self.file_path = file_path
         self.fsync_every = max(1, fsync_every)
         self.rotate_bytes = rotate_bytes
-        self._entries: List[AuditEntry] = []
+        self._entries = deque(maxlen=max_memory_entries)
         self._last_hash = self.GENESIS_HASH
         # absolute next index — len(self._entries) is NOT the next index
         # after recovering a rotated segment (REL-02): a segment starting
@@ -79,7 +97,8 @@ class AuditLedger:
 
     @property
     def entries(self) -> List[AuditEntry]:
-        return list(self._entries)
+        with self._lock:
+            return list(self._entries)
 
     # ---- recovery ---------------------------------------------------------
     def _recover(self) -> None:
@@ -88,50 +107,33 @@ class AuditLedger:
         silent fresh chain on top of historical records."""
         if not os.path.exists(self.file_path):
             return
-        recovered: List[AuditEntry] = []
+        recovered = deque(maxlen=self.max_memory_entries)
+        previous = None
         with open(self.file_path, "r", encoding="utf-8") as f:
             for lineno, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    d = json.loads(line)
-                    entry = AuditEntry(**d)
-                except Exception as e:
+                    entry = AuditEntry(**json.loads(line))
+                except Exception as error:
                     raise LedgerIntegrityError(
-                        f"{self.file_path}:{lineno}: unreadable ledger entry ({e})"
-                    ) from e
+                        f"{self.file_path}:{lineno}: unreadable ledger entry ({error})"
+                    ) from error
+                if previous is None:
+                    valid = entry.index != 0 or entry.prev_hash == self.GENESIS_HASH
+                else:
+                    valid = (entry.index == previous.index + 1
+                             and entry.prev_hash == previous.entry_hash)
+                if not valid or entry.compute_hash() != entry.entry_hash:
+                    raise LedgerIntegrityError(f"{self.file_path}:{lineno}: broken audit chain")
                 recovered.append(entry)
-        if not recovered:
+                previous = entry
+        if previous is None:
             return
-        # internal chain: indices sequential from the file's own start
-        # (rotation restarts the file mid-chain with a non-zero index) and
-        # prev_hash/entry_hash consistent; genesis required when index==0
-        start = recovered[0].index
-        if start == 0 and recovered[0].prev_hash != self.GENESIS_HASH:
-            raise LedgerIntegrityError(
-                f"{self.file_path}: first entry claims index 0 but prev_hash is not genesis"
-            )
-        expected_prev = recovered[0].prev_hash
-        for offset, entry in enumerate(recovered):
-            if entry.index != start + offset:
-                raise LedgerIntegrityError(
-                    f"{self.file_path}: index discontinuity at file offset {offset} "
-                    f"(expected {start + offset}, got {entry.index})"
-                )
-            if entry.prev_hash != expected_prev:
-                raise LedgerIntegrityError(
-                    f"{self.file_path}: chain broken at index {entry.index} "
-                    f"(prev_hash mismatch — entries were altered or removed)"
-                )
-            if entry.compute_hash() != entry.entry_hash:
-                raise LedgerIntegrityError(
-                    f"{self.file_path}: entry hash mismatch at index {entry.index} (tampered content)"
-                )
-            expected_prev = entry.entry_hash
         self._entries = recovered
-        self._last_hash = recovered[-1].entry_hash
-        self._next_index = recovered[-1].index + 1
+        self._last_hash = previous.entry_hash
+        self._next_index = previous.index + 1
         self._bytes_written = os.path.getsize(self.file_path)
 
     # ---- durable append ----------------------------------------------------
@@ -154,7 +156,85 @@ class AuditLedger:
         os.replace(self.file_path, backup)
         self._bytes_written = 0
 
-    def record(
+    def record(self, *args, **kwargs) -> AuditEntry:
+        """Synchronous durable append; a write failure poisons further appends."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("audit ledger is closed")
+            if self._failure is not None:
+                raise LedgerIntegrityError("audit writer previously failed") from self._failure
+            try:
+                return self._record(*args, **kwargs)
+            except Exception as error:
+                self._failure = error
+                raise
+
+    async def record_async(self, *args, **kwargs) -> AuditEntry:
+        """Bounded single-writer submission; completion includes flush/fsync.
+
+        This async API belongs to one event loop. Cancellation waits for the
+        accepted append's outcome before releasing its queue slot.
+        """
+        if self._async_closing:
+            raise RuntimeError("audit ledger is closing")
+        if not self.file_path:
+            return self.record(*args, **kwargs)
+        if self._async_slots is None:
+            self._async_slots = asyncio.Semaphore(self._write_queue_size)
+        async with self._async_slots:
+            if self._async_closing:
+                raise RuntimeError("audit ledger is closing")
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eacp-audit")
+            work = asyncio.get_running_loop().run_in_executor(
+                self._executor, lambda: self.record(*args, **kwargs)
+            )
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                while not work.done():
+                    try:
+                        await asyncio.shield(work)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not work.cancelled():
+                    error = work.exception()
+                    if error is not None:
+                        raise error
+                raise
+
+    async def close_async(self) -> None:
+        """Drain accepted writes and perform the final fsync off the loop."""
+        self._async_closing = True
+        executor = self._executor
+        if executor is None:
+            if not self.file_path:
+                self.close()
+                return
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eacp-audit")
+            self._executor = executor
+        try:
+            work = asyncio.get_running_loop().run_in_executor(executor, self._close_file)
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                while not work.done():
+                    try:
+                        await asyncio.shield(work)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not work.cancelled() and work.exception() is not None:
+                    raise work.exception()
+                raise
+        finally:
+            executor.shutdown(wait=True)
+            self._executor = None
+
+    def _record(
         self,
         tx_id: int,
         sender_pin: int,
@@ -166,7 +246,6 @@ class AuditLedger:
     ) -> AuditEntry:
         """Appends a cryptographically chained audit record."""
         index = self._next_index
-        self._next_index += 1
         now = time.time()
 
         # Digest payload content (without storing sensitive PII in plain text)
@@ -190,8 +269,6 @@ class AuditLedger:
             data_digest=data_digest,
         )
         entry.entry_hash = entry.compute_hash()
-        self._entries.append(entry)
-        self._last_hash = entry.entry_hash
 
         # Persist: one handle, flushed every record, fsync'd periodically
         if self.file_path:
@@ -207,19 +284,37 @@ class AuditLedger:
                 os.fsync(fh.fileno())
                 self._since_fsync = 0
 
+        self._entries.append(entry)
+        self._last_hash = entry.entry_hash
+        self._next_index += 1
         return entry
 
+    def _close_file(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                    os.fsync(self._fh.fileno())
+                finally:
+                    self._fh.close()
+                    self._fh = None
+
     def close(self) -> None:
-        """Final durability barrier (fsync + release)."""
-        if self._fh is not None:
-            try:
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
-            finally:
-                self._fh.close()
-                self._fh = None
+        """Synchronous final durability barrier; async users use close_async."""
+        self._async_closing = True
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._executor = None
+        self._close_file()
 
     def verify_chain(self) -> bool:
+        """Verify the retained in-memory suffix (startup verifies the full file)."""
+        with self._lock:
+            return self._verify_chain()
+
+    def _verify_chain(self) -> bool:
         """
         Cryptographic verification of the entire ledger chain:
         Validates sequential indices, prev_hash link, and individual entry_hash integrity.

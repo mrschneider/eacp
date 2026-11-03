@@ -66,27 +66,26 @@ class PayloadTokenMeter:
     Bounded and reproducible — suitable for tests and non-LLM tools.
     """
 
-    def measure(self, frame: EacpFrame, result: object) -> int:
+    @staticmethod
+    def request_size(frame: EacpFrame) -> int:
         try:
-            req = len(json.dumps(frame.data or {}).encode("utf-8"))
+            return len(json.dumps(frame.data or {}).encode("utf-8"))
         except (TypeError, ValueError):
-            req = 0
+            return 0
+
+    def measure_with_request_size(self, request_bytes: int, result: object) -> int:
         try:
             res = len(json.dumps(result, default=str).encode("utf-8"))
         except (TypeError, ValueError):
             res = 0
-        return (req + res + 3) // 4
+        return (request_bytes + res + 3) // 4
+
+    def measure(self, frame: EacpFrame, result: object) -> int:
+        return self.measure_with_request_size(self.request_size(frame), result)
 
     def estimate_request(self, frame: EacpFrame) -> int:
-        """PRE-dispatch half of `measure`: the request payload alone. The
-        dispatcher consumes this BEFORE running the handler, so a request
-        whose payload already exceeds the envelope is refused without any
-        handler execution (a post-hoc measure cannot prevent that spend)."""
-        try:
-            req = len(json.dumps(frame.data or {}).encode("utf-8"))
-        except (TypeError, ValueError):
-            req = 0
-        return (req + 3) // 4
+        """Pre-dispatch estimate, using the historical whitespace/rounding rules."""
+        return (self.request_size(frame) + 3) // 4
 
 
 @dataclass

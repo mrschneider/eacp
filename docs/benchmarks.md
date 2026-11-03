@@ -71,3 +71,37 @@ comparable across implementations until the Rust relay has peering
 - Sustained-load runs, multi-hour memory drift, and cold-start time —
   single-run methodology only; the harness is the tool, the numbers above
   are a first calibration, not a certification.
+
+## Performance follow-up (local measurements)
+
+The Rust TCP accept path now sets TCP_NODELAY. An isolated experiment changing
+only this socket option increased pipelined throughput from roughly 602 to
+3,838 requests/s; sequential throughput stayed around 1,400 requests/s. This
+supports Nagle/delayed-ACK stalls as the cause of the earlier inversion; signature
+verification and replay refusal were retained.
+
+Three runs with all follow-up changes, using:
+
+```bash
+python bench/relay_bench.py --requests 160 --conns 20 --flood 100
+```
+
+| Rust relay | Run 1 | Run 2 | Run 3 |
+|---|---:|---:|---:|
+| Sequential requests/s | 1,177 | 1,476 | 1,203 |
+| Pipelined requests/s (32 concurrent) | 3,440 | 3,007 | 3,192 |
+
+All three runs drained all 100 queued frames. These are small loopback runs on a
+shared development machine, not production capacity estimates. Both relays
+verify signed frames. The follow-up also moves synchronous client callbacks to
+worker threads by default, so full-stack timing includes that scheduling cost.
+Short nonblocking callbacks may explicitly select `run_in_thread=False`.
+
+Microbenchmarks measured empty custody pruning at about 0.12 µs for both 100 and
+100,000 bundles (previously about 9 µs and 12.6 ms). A heartbeat for one topic
+among 10,000 topics fell from about 160 µs to 0.13 µs. A 123 KB frame's atomic
+encode/sign/pack took about 1,518 µs versus 2,160 µs through the retained legacy
+sign-then-pack API (about 30% less time in the same run). Compression and JSON
+wire bytes are unchanged. A 20,000-entry in-memory audit workload retained about
+3.6 MB instead of 7.2 MB with the default 10,000-entry suffix; retention remains
+bounded as more records arrive.

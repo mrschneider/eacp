@@ -359,3 +359,31 @@ Full per-file map of the repository (kept here so the README stays lean):
     ├── test_tactical.py     # Tactical resiliency: DDS QoS arbitration & DTN custody transfer
     └── test_rust_relay.py   # Python agent <-> Native Rust Relay E2E rendezvous & deadlock test
 ```
+
+## Performance follow-up: execution, serialization, and audit bounds
+
+The protocol signing contract and wire version are unchanged. Outgoing client
+frames use an atomic encode/sign/pack call rather than a persistent serialization
+cache. Verification still derives signed bytes from current frame state or the
+original parsed payload. Built-in request metering snapshots the admitted
+request's serialized size for the invocation; custom meters retain their hooks.
+
+Async handlers remain cooperative on the event loop. Synchronous RSessionBase
+handlers default to bounded worker execution, with an explicit loop-affinity
+opt-out. Cancellation of a running worker waits for completion while retaining
+its handler slot and token escrow. This limits concurrency but cannot undo
+external side effects or forcibly stop blocking code.
+
+Audit persistence is serialized through a dedicated single writer. At most the
+configured number of appends are submitted; completion means the existing flush
+and periodic fsync boundary has been met. Routing awaits that result. Write
+failures propagate, poison subsequent appends, and require recovery rather than
+silent retry. Shutdown drains submitted writes and performs the final fsync.
+The retained in-memory history is a configurable suffix (10,000 entries by
+default); recovery verifies every entry in the active file before retaining only
+that suffix. Disk segment rotation and hash/index continuity are unchanged.
+
+Custody expiry uses a min-heap with bounded lazy deletion; ownership heartbeats
+use an agent-to-topics reverse index and winner selection takes one pass. The
+Rust TCP accept path sets TCP_NODELAY; signatures, replay checks, and routing
+order remain enforced as before.

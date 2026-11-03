@@ -198,6 +198,8 @@ class EacpRelay:
         audit_file_path: Optional[str] = None,
         max_queue_total: int = 10_000,
         max_queue_bytes: int = 64 * 1024 * 1024,
+        audit_max_memory_entries: Optional[int] = 10_000,
+        audit_queue_size: int = 256,
     ):
         self.relay_id = relay_id
         self.max_push_queue = max_push_queue
@@ -224,7 +226,10 @@ class EacpRelay:
 
         # Enterprise extensions
         self.metrics: EacpMetrics = EacpMetrics()
-        self.ledger: AuditLedger = AuditLedger(file_path=audit_file_path)
+        self.ledger: AuditLedger = AuditLedger(
+            file_path=audit_file_path, max_memory_entries=audit_max_memory_entries,
+            write_queue_size=audit_queue_size,
+        )
         self.mesh: MeshRoutingTable = MeshRoutingTable(local_relay_id=relay_id)
 
     # ------------------------------------------------------------------
@@ -721,7 +726,7 @@ class EacpRelay:
             trace_id = tc.trace_id if tc else None
 
         # Audit ledger record & metrics tracking
-        self.ledger.record(
+        await self.ledger.record_async(
             tx_id=frame.transaction_id,
             sender_pin=sender_pin,
             target_pin=target_pin,
@@ -942,9 +947,12 @@ class EacpRelay:
             except Exception:
                 pass
         self._active_connections.clear()
-        for task in list(self._connection_tasks):
+        connection_tasks = list(self._connection_tasks)
+        for task in connection_tasks:
             if not task.done():
                 task.cancel()
+        if connection_tasks:
+            await asyncio.gather(*connection_tasks, return_exceptions=True)
         self._connection_tasks.clear()
 
         # 2. Close listening server with a bounded wait so a stubborn
@@ -961,12 +969,12 @@ class EacpRelay:
             except Exception:
                 pass
         self.push_queues.clear()
-        closer = getattr(self.ledger, "close", None)
+        closer = getattr(self.ledger, "close_async", None)
         if closer is not None:
             try:
-                closer()
+                await closer()
             except Exception:
-                pass
+                logger.exception("Audit ledger shutdown failed")
 
 
 def main() -> None:
@@ -979,6 +987,9 @@ def main() -> None:
     parser.add_argument("--max-queue", type=int, default=1000, help="Max offline push queue per agent")
     parser.add_argument("--max-queue-total", type=int, default=10_000, help="Global offline queue frame budget")
     parser.add_argument("--max-queue-mb", type=int, default=64, help="Global offline queue byte budget (MB)")
+    parser.add_argument("--audit-file", default=None, help="Durable audit log path")
+    parser.add_argument("--audit-memory-entries", type=int, default=10_000, help="Audit history retained in memory")
+    parser.add_argument("--audit-queue", type=int, default=256, help="Max submitted audit writes")
     parser.add_argument("--max-payload-mb", type=int, default=16, help="Max frame payload size in MB")
     parser.add_argument("--heartbeat-timeout", type=float, default=90.0, help="Heartbeat timeout in seconds")
     args = parser.parse_args()
@@ -986,6 +997,9 @@ def main() -> None:
     async def _run() -> None:
         relay = EacpRelay(
             max_push_queue=args.max_queue,
+            audit_file_path=args.audit_file,
+            audit_max_memory_entries=args.audit_memory_entries,
+            audit_queue_size=args.audit_queue,
             max_queue_total=args.max_queue_total,
             max_queue_bytes=args.max_queue_mb * 1024 * 1024,
             max_payload_size=args.max_payload_mb * 1024 * 1024,

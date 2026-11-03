@@ -13,9 +13,9 @@ client code, loopback TCP). Scenarios:
   5. mesh/multi-relay - SKIPPED: not equivalent across implementations until
                   the Rust relay has peering (ARCHITECTURE.md 8.3).
 
-Honest settings note: the Python relay verifies Ed25519 signatures on every
-signed frame; the Rust relay does not verify signatures yet (8.3). The wire
-is byte-identical; the CPU delta below is the price of that check.
+Both relays verify Ed25519 signing-contract-v2 signatures on every signed
+application frame. The wire and client workload are identical; TLS, audit,
+CA-manifest validation, and mesh support remain implementation differences.
 
 Usage:  python3 bench/relay_bench.py [--requests 300] [--json out.json]
 """

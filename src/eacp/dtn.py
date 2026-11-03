@@ -7,6 +7,7 @@ resilience for autonomous multi-agent meshes operating in partitioned or lossy e
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
+import heapq
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -87,6 +88,8 @@ class CustodyStore:
         # Duplicate suppression ring/set
         self._seen_ids: Set[int] = set()
         self._seen_order: deque = deque()
+        self._expiry_index: Dict[int, float] = {}
+        self._expiry_heap: List[Tuple[float, int]] = []
 
     @property
     def bundle_count(self) -> int:
@@ -168,6 +171,9 @@ class CustodyStore:
 
         self._bundles[bundle.bundle_id] = bundle
         self._storage_used += bundle_size
+        expiry = bundle.creation_time_s + bundle.lifetime_s
+        self._expiry_index[bundle.bundle_id] = expiry
+        heapq.heappush(self._expiry_heap, (expiry, bundle.bundle_id))
 
         signal = (
             CustodySignal.CUSTODY_ACCEPTED
@@ -235,6 +241,10 @@ class CustodyStore:
         bundle = self._bundles.pop(bundle_id, None)
         if bundle is not None:
             self._storage_used = max(0, self._storage_used - bundle.size_bytes())
+            self._expiry_index.pop(bundle_id, None)
+            if len(self._expiry_heap) > 2 * len(self._expiry_index) + 64:
+                self._expiry_heap = [(expiry, bid) for bid, expiry in self._expiry_index.items()]
+                heapq.heapify(self._expiry_heap)
             return True
         return False
 
@@ -242,10 +252,13 @@ class CustodyStore:
         """Evicts expired bundles from custody store."""
         t = now if now is not None else time.time()
         expired: List[int] = []
-        for bundle_id, bundle in list(self._bundles.items()):
-            if bundle.is_expired(now=t):
-                expired.append(bundle_id)
-                self.release_custody(bundle_id)
+        # Lifetime equality is live, matching Bundle.is_expired().
+        while self._expiry_heap and self._expiry_heap[0][0] < t:
+            expiry, bundle_id = heapq.heappop(self._expiry_heap)
+            if self._expiry_index.get(bundle_id) != expiry:
+                continue
+            expired.append(bundle_id)
+            self.release_custody(bundle_id)
         return expired
 
     def get_bundle(self, bundle_id: int) -> Optional[Bundle]:

@@ -194,3 +194,39 @@ Per-file map: [ARCHITECTURE.md — Appendix](ARCHITECTURE.md#appendix--directory
 ## License
 
 MIT.
+### Bounded execution and audit performance
+
+`RSessionBase.register_handler()` runs ordinary synchronous callbacks in worker
+threads by default; async handlers remain on the event loop. For a short callback
+that requires event-loop affinity, pass `run_in_thread=False`. Handler concurrency
+and admission limits still apply. A running Python thread cannot be interrupted:
+on cancellation its slot and escrow remain held until it finishes, after which
+normal cancellation cleanup runs. Use async handlers or separately managed
+processes for work that must stop promptly.
+
+Clients use `AgentIdentity.pack_frame(frame)` to encode data, sign, and pack in a
+single synchronous operation. No persistent mutable-payload cache is installed;
+legacy `sign_frame()` and `pack()` remain available. Signed bytes, compression,
+JSON formatting, and metering rounding are unchanged. The built-in token meter
+reuses the pre-dispatch request-size measurement for that invocation, so metering
+refers to the admitted request even if the handler later mutates its data.
+
+`AuditLedger` retains the latest 10,000 records in memory by default. Set
+`max_memory_entries=0` to retain none or `None` to explicitly retain all.
+`entries` and `verify_chain()` cover this in-memory suffix; startup still streams
+and verifies the entire active log file, including entries outside the retained
+suffix. File rotation and per-record flush / periodic fsync semantics remain.
+
+The relay uses `record_async()` with a dedicated single writer and at most 256
+submitted writes (`write_queue_size`); callers wait for capacity and append
+completion, so audit failures cannot silently bypass routing. Cancellation waits
+for accepted writes to settle, and `close_async()` drains them before the final
+fsync. A write failure poisons the writer: further appends fail until the ledger
+is reopened and recovered. No automatic retry risks duplicate/partial appends.
+Synchronous users may continue using `record()` / `close()`.
+
+For relay deployments, configure `audit_file_path`, `audit_max_memory_entries`,
+and `audit_queue_size`, or CLI flags `--audit-file`, `--audit-memory-entries`,
+and `--audit-queue`. Without an audit file the bounded history is memory-only.
+The Rust TCP relay enables TCP_NODELAY to avoid small-frame delayed-ACK stalls;
+Unix-domain sockets are unaffected.

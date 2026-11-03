@@ -86,6 +86,15 @@ class AgentIdentity:
         sig = self.sign(signed_data)
         frame.envelope.signature = sig
 
+    def pack_frame(self, frame: EacpFrame, session_handle: int = 0) -> bytes:
+        """Atomically encode, sign and pack once; retain no mutable-data cache."""
+        frame.sender_pin = self.pin
+        frame.flags |= FrameFlags.FLAG_SIGNED
+        frame.envelope = CryptoEnvelope(session_handle=session_handle, signature=b"")
+        data = frame._encode_data()
+        frame.envelope.signature = self.sign(frame.get_signed_bytes(data))
+        return frame.pack(data)
+
 
 @dataclass
 class AgentVerifier:
