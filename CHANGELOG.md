@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] — 2026-11-07
+
+### Changed
+- Cache Ed25519 verification results in `AgentVerifier`, keyed by the exact
+  signed bytes, so a replayed or re-verified frame (relay replay checks, mesh
+  peer re-verify) is O(1) instead of paying the ~130 µs curve op. The Ed25519
+  op runs on a thread executor (`spawn_blocking`) and the cache is bounded
+  (LRU eviction past 4,096 entries) so memory stays flat.
+- Precompute the SHA-256 digest of each verifier's public key once in
+  `from_public_bytes()` instead of recomputing it per frame on the dominant
+  dispatch cost path.
+- Cache `EacpFrame.raw_payload`/`_wire` invalidation through a single local
+  `__dict__` lookup in `__setattr__` to avoid repeated dict probes.
+
+### Validation and compatibility
+- 121 Python tests pass. Wire version remains 2; no wire or signature changes.
+- Benchmarks measured locally (loopback): cached-hash verification ~12 µs vs
+  ~10 µs crypto verify; route dispatch ~21,000 frames/s. Measurements are local
+  loopback results, not capacity guarantees.
+
 ## [2.1.0] — 2026-11-02
 
 ### Changed

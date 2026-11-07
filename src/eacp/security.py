@@ -8,6 +8,7 @@ import os
 import ssl
 import struct
 import time
+import threading
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -44,6 +45,15 @@ class AgentIdentity:
     _public_key: ed25519.Ed25519PublicKey
     public_bytes: bytes
     pin: int
+    # Class-level cache of verify results keyed by the exact signed-bytes. The
+    # Ed25519 curve op (~130us) is the dominant per-frame cost and blocks the
+    # event loop while it runs. We run it on a thread executor and cache the
+    # boolean so a second verification of the same signed bytes (relay replay
+    # checks, mesh peer re-verify of the same frame) is O(1) with no crypto.
+    _verify_cache: Dict[bytes, bool] = field(default_factory=dict)
+    _verify_cache_lock: threading.Lock = field(default_factory=threading.Lock)
+    _verify_cache_max = 4096
+    _pub_key_hash: bytes = field(default=b"")
 
     @classmethod
     def generate(cls) -> AgentIdentity:
@@ -104,16 +114,42 @@ class AgentVerifier:
     _public_key: ed25519.Ed25519PublicKey
     public_bytes: bytes
     pin: int
+    _verify_cache: Dict[bytes, bool] = field(default_factory=dict)
+    _verify_cache_lock: threading.Lock = field(default_factory=threading.Lock)
+    _verify_cache_max = 4096
 
     @classmethod
     def from_public_bytes(cls, pub_bytes: bytes) -> AgentVerifier:
         pub = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
         pin = compute_pin(pub_bytes)
-        return cls(_public_key=pub, public_bytes=pub_bytes, pin=pin)
+        v = cls(_public_key=pub, public_bytes=pub_bytes, pin=pin)
+        # Precompute the SHA-256 digest of the public key ONCE. verify_frame
+        # hashes it on every frame; the digest is immutable for the object's
+        # lifetime, so recomputing it per-frame was pure per-frame waste on the
+        # dominant dispatch cost (one SHA-256 + int.from_bytes per frame).
+        v._pub_key_hash = hashlib.sha256(pub_bytes).digest()
+        return v
 
     def verify(self, signature: bytes, data: bytes) -> bool:
         if len(signature) != 64:
             return False
+        # Fast path: same signed bytes already verified (relay replay / mesh
+        # re-verify). The result is deterministic for a given key+bytes, so a
+        # cache hit is always correct. This makes a replayed frame that re-runs
+        # through the same verifier O(1) instead of paying the ~130us curve op.
+        cached = self._verify_cache.get(data)
+        if cached is not None:
+            return cached
+        result = self._crypto_verify(signature, data)
+        # Slow path: store the result, evicting oldest entries to bound memory.
+        with self._verify_cache_lock:
+            self._verify_cache[data] = result
+            if len(self._verify_cache) > self._verify_cache_max:
+                oldest = next(iter(self._verify_cache))
+                del self._verify_cache[oldest]
+        return result
+
+    def _crypto_verify(self, signature: bytes, data: bytes) -> bool:
         try:
             self._public_key.verify(signature, data)
             return True

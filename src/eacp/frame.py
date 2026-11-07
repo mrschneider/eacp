@@ -3,9 +3,12 @@ EACP 48-byte binary frame and 4-slot payload serializer.
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import struct
 import zlib
+
+sha256 = hashlib.sha256
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
@@ -104,9 +107,10 @@ class EacpFrame:
         fields), while the unmodified relay verify/forward path keeps the
         zero-re-encode fast path in get_signed_bytes / pack."""
         if name not in ("raw_payload", "_wire"):
-            if self.__dict__.get("raw_payload") is not None:
+            d = self.__dict__
+            if d.get("raw_payload") is not None:
                 object.__setattr__(self, "raw_payload", None)
-            if self.__dict__.get("_wire") is not None:
+            if d.get("_wire") is not None:
                 object.__setattr__(self, "_wire", None)
         object.__setattr__(self, name, value)
 
