@@ -1,6 +1,7 @@
 """Regressions for bounded resources and faster signed request processing."""
 import asyncio
 import copy
+import hashlib
 import json
 import tempfile
 import threading
@@ -18,6 +19,52 @@ from eacp.ledger import AuditLedger, LedgerIntegrityError
 from eacp.qos import OwnershipArbitrator
 from eacp.relay import EacpRelay
 from eacp.security import AgentIdentity, AgentVerifier
+
+
+class VerifyCacheTests(unittest.TestCase):
+    """Regression tests for AgentVerifier.verify cache + LRU eviction."""
+
+    def _frame(self, ident):
+        frame = EacpFrame(verb='echo', data=b'x' * 4096)
+        ident.sign_frame(frame)
+        return frame
+
+    def test_cache_hit_is_equivalent_to_full_verify(self):
+        ident = AgentIdentity.generate()
+        v = AgentVerifier.from_public_bytes(ident.public_bytes)
+        f = self._frame(ident)
+        data = f.get_signed_bytes()
+        sig = f.envelope.signature
+        self.assertTrue(v.verify(sig, data))
+        # second call is a cache hit and must return the same result
+        self.assertTrue(v.verify(sig, data))
+
+    def test_tampered_data_is_never_served_from_cache(self):
+        # A cache hit must correspond ONLY to the exact bytes verified:
+        # mutating the data changes its SHA-256, so the lookup misses and the
+        # curve op runs on the tampered bytes and rejects.
+        ident = AgentIdentity.generate()
+        v = AgentVerifier.from_public_bytes(ident.public_bytes)
+        f = self._frame(ident)
+        data = f.get_signed_bytes()
+        sig = f.envelope.signature
+        self.assertTrue(v.verify(sig, data))
+        tampered = bytearray(data); tampered[5] ^= 0x01
+        self.assertFalse(v.verify(sig, bytes(tampered)))
+        # a wrong signature is still rejected (no cache shortcut)
+        self.assertFalse(v.verify(b'\x01' * 64, data))
+
+    def test_lru_eviction_bounds_cache_and_keeps_hot_entry(self):
+        ident = AgentIdentity.generate()
+        v = AgentVerifier.from_public_bytes(ident.public_bytes)
+        v._verify_cache_max = 4
+        frames = [self._frame(ident) for _ in range(6)]
+        for fr in frames:
+            v.verify_frame(fr)
+        self.assertLessEqual(len(v._verify_cache), 4)
+        # the hot frame (touched last) survives, an early one is evicted
+        self.assertIn((hashlib.sha256(frames[-1].get_signed_bytes()).digest(),
+                       frames[-1].envelope.signature), v._verify_cache)
 
 
 class SerializationTests(unittest.TestCase):

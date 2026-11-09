@@ -3,12 +3,10 @@ EACP 48-byte binary frame and 4-slot payload serializer.
 """
 
 from __future__ import annotations
-import hashlib
 import json
 import struct
 import zlib
 
-sha256 = hashlib.sha256
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
@@ -99,19 +97,36 @@ class EacpFrame:
     # Cleared on any post-construction field mutation (see __setattr__) so a
     # tampered frame falls back to re-encoding and the change is visible.
     _wire: Optional[bytes] = None
+    # Signing-contract v2 bytes, computed lazily on the first
+    # get_signed_bytes() call and reused by repeated verifications of the
+    # same parsed frame (relay replay re-checks, mesh peer re-verify):
+    # without this, each re-verify re-concatenates the full payload
+    # (~40-250us for 4KB-64KB payloads) just to rebuild the identical input.
+    # Cleared on any field mutation, exactly like raw_payload/_wire, so a
+    # tampered frame re-derives and the change is visible to the signature.
+    # (The SHA-256 digest of these bytes is deliberately NOT memoized here:
+    # AgentVerifier.verify() must hash the data it is actually given to build
+    # its cache key — a digest computed elsewhere and passed in could go
+    # stale if a field mutated, and a stale digest hitting a cached True
+    # would let tampered data verify. One hash, inside verify(), is the
+    # sound bound.)
+    _signed_cache: Optional[bytes] = None
 
     def __setattr__(self, name: str, value: object) -> None:
         """Post-construction mutation of any field invalidates the parsed
-        wire caches (raw_payload and _wire): verification must still SEE
-        tampering (test_frame_signing_and_verification re-encodes mutated
-        fields), while the unmodified relay verify/forward path keeps the
-        zero-re-encode fast path in get_signed_bytes / pack."""
-        if name not in ("raw_payload", "_wire"):
+        wire caches (raw_payload, _wire and the signed-bytes caches):
+        verification must still SEE tampering (test_frame_signing_and_
+        verification re-encodes mutated fields), while the unmodified relay
+        verify/forward path keeps the zero-re-encode fast paths in
+        get_signed_bytes / pack."""
+        if name not in ("raw_payload", "_wire", "_signed_cache"):
             d = self.__dict__
             if d.get("raw_payload") is not None:
                 object.__setattr__(self, "raw_payload", None)
             if d.get("_wire") is not None:
                 object.__setattr__(self, "_wire", None)
+            if d.get("_signed_cache") is not None:
+                object.__setattr__(self, "_signed_cache", None)
         object.__setattr__(self, name, value)
 
     def is_pulse(self) -> bool:
@@ -258,7 +273,18 @@ class EacpFrame:
                         int(self.status),
                         payload_len_field,
                     )
-                    return hdr + self.raw_payload[:16] + slots_012 + s3_head
+                    signed = hdr + self.raw_payload[:16] + slots_012 + s3_head
+                    # Memoize for repeated verifications of this parsed frame
+                    # (replay re-check, mesh re-verify): rebuilding this
+                    # concatenation of a 64KB payload is ~40us per call.
+                    # __setattr__ clears this on any field mutation, so
+                    # tampered frames re-derive. (pack() also clears it
+                    # explicitly, because its compression path sets flags
+                    # directly.)
+                    self._signed_cache = signed
+                    return signed
+        if self._signed_cache is not None:
+            return self._signed_cache
         slot0 = self.verb.encode("utf-8") if self.verb else b""
         slot1 = self._encode_data() if _data_bytes is None else _data_bytes
         slot2 = (self.constraints or ExecutionConstraints()).pack()
@@ -303,6 +329,10 @@ class EacpFrame:
         # mutation via __setattr__ (tamper detection preserved).
         if self._wire is not None:
             return self._wire
+        # pack_slots() may set FLAG_COMPRESSED directly on self.flags
+        # (bypassing __setattr__), which would silently invalidate the
+        # signed-bytes memo; clear it before that mutation.
+        self._signed_cache = None
         payload = self.pack_slots(_data_bytes)
         payload_len = len(payload)
         header = HEADER_STRUCT.pack(

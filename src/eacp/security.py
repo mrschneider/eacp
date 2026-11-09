@@ -9,6 +9,7 @@ import ssl
 import struct
 import time
 import threading
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -114,7 +115,22 @@ class AgentVerifier:
     _public_key: ed25519.Ed25519PublicKey
     public_bytes: bytes
     pin: int
-    _verify_cache: Dict[bytes, bool] = field(default_factory=dict)
+    # Class-level cache of verify results. The Ed25519 curve op (~130-220us)
+    # is the dominant per-frame cost and blocks the event loop while it runs,
+    # so a second verification of the same signed bytes (relay replay checks,
+    # mesh peer re-verify of the same frame) must be O(1) with no crypto.
+    #
+    # Key is (SHA-256(signed_bytes), signature) — 96 fixed bytes — NOT the
+    # full signed bytes. Keying on the raw payload made every lookup a
+    # hash+compare over up to 64KB+ (O(payload): ~40us extra on a 64KB
+    # frame) and stored 4096 x payload-sized keys (~256MB at 64KB) for
+    # bounded memory that was never bounded by design. A (digest, sig)
+    # tuple is O(1) in payload size, bounds memory at ~400KB, and is
+    # unforgeable: an attacker cannot produce a DIFFERENT signed byte
+    # stream with the same SHA-256 digest, and the signature in the key
+    # is checked against the same digest on the slow path, so a hit can
+    # only ever return the result of the exact (key, data) pair.
+    _verify_cache: "OrderedDict[Tuple[bytes, bytes], bool]" = field(default_factory=OrderedDict)
     _verify_cache_lock: threading.Lock = field(default_factory=threading.Lock)
     _verify_cache_max = 4096
 
@@ -137,16 +153,31 @@ class AgentVerifier:
         # re-verify). The result is deterministic for a given key+bytes, so a
         # cache hit is always correct. This makes a replayed frame that re-runs
         # through the same verifier O(1) instead of paying the ~130us curve op.
-        cached = self._verify_cache.get(data)
-        if cached is not None:
-            return cached
-        result = self._crypto_verify(signature, data)
-        # Slow path: store the result, evicting oldest entries to bound memory.
+        # Key on (SHA-256(data), signature): a hit can only correspond to the
+        # exact bytes verified (SHA-256 collision resistance), so the cached
+        # result is sound. The digest is computed HERE, from the data actually
+        # verified — never taken from a caller (a caller-supplied digest
+        # computed before a field mutation would let tampered data hit a
+        # cached True). Keying on the raw payload made every lookup a
+        # hash+compare over up to 64KB+ (O(payload)) and stored 4096 x
+        # payload-sized keys (~256MB at 64KB); the digest is O(1) in payload
+        # size and bounds memory at ~400KB.
+        key = (hashlib.sha256(data).digest(), signature)
         with self._verify_cache_lock:
-            self._verify_cache[data] = result
-            if len(self._verify_cache) > self._verify_cache_max:
-                oldest = next(iter(self._verify_cache))
-                del self._verify_cache[oldest]
+            cached = self._verify_cache.get(key)
+            if cached is not None:
+                # LRU touch: reinsert at the most-recently-used end.
+                self._verify_cache.move_to_end(key)
+                return cached
+        result = self._crypto_verify(signature, data)
+        # Slow path: store the result; evict the LEAST-recently-used entry to
+        # bound memory (the old first-inserted eviction discarded entries in
+        # insertion order, so a hot entry inserted early was dropped first).
+        with self._verify_cache_lock:
+            self._verify_cache[key] = result
+            self._verify_cache.move_to_end(key)
+            while len(self._verify_cache) > self._verify_cache_max:
+                self._verify_cache.popitem(last=False)
         return result
 
     def _crypto_verify(self, signature: bytes, data: bytes) -> bool:

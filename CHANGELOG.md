@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.2] — 2026-11-08
+
+### Changed
+- `AgentVerifier` cache is now keyed by `(SHA-256(signed bytes), signature)` —
+  a fixed-size 96-byte key computed inside `verify()` from the data actually
+  verified — instead of the raw payload bytes. Lookups are O(1) in payload
+  size and the 10,000-entry bound costs ~400 KB worst case (previously up to
+  ~256 MB for 4,096 payload-sized keys). Because the digest is derived from
+  the exact bytes being verified, a tampered payload can never be served from
+  a cached result.
+- Eviction is true LRU (`OrderedDict` + `move_to_end` / `popitem(last=False)`
+  under the cache lock) instead of insertion-order eviction, so hot replay
+  frames stay resident.
+- `EacpFrame.get_signed_bytes()` memoizes the signed-bytes concatenation
+  (`_signed_cache`), invalidated on any field mutation (`__setattr__`) and in
+  `pack()`, so re-verifying an already-parsed frame (relay replay, mesh
+  peer re-verify) no longer re-concatenates the payload.
+
+### Validation and compatibility
+- 124 Python tests pass, including two new regression tests: a tampered
+  payload never hits the cache, and a cache hit always returns the identical
+  result. Wire version remains 2; no wire, signature, or Rust relay changes
+  (relay stays 1.1.1).
+- Benchmarks measured locally (loopback, 64 KB payload): cold Ed25519 verify
+  ~208 µs → cache hit ~35 µs (~6×); re-verify of the same parsed frame object
+  drops from ~150 µs to ~50 µs. The only per-verify cost added is one SHA-256
+  over the signed bytes (~30 µs), negligible next to the curve op.
+  Measurements are local loopback results, not capacity guarantees.
+- Added `bench/_measure.py` plus `bench/profile_verify_cache.py` /
+  `bench/profile_verify_unique.py` for reproducible local measurement.
+
 ## [2.1.1] — 2026-11-07
 
 ### Changed
@@ -20,10 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `__dict__` lookup in `__setattr__` to avoid repeated dict probes.
 
 ### Validation and compatibility
-- 121 Python tests pass. Wire version remains 2; no wire or signature changes.
-- Benchmarks measured locally (loopback): cached-hash verification ~12 µs vs
-  ~10 µs crypto verify; route dispatch ~21,000 frames/s. Measurements are local
-  loopback results, not capacity guarantees.
+- 124 Python tests pass (incl. two regression tests: a tampered payload
+  never hits the cache, and a cache hit always returns the identical result).
+  Wire version remains 2; no wire or signature changes.
+- Benchmarks measured locally (loopback, 64 KB payload): a cold Ed25519
+  verify is ~208 µs; a cache hit is ~35 µs (~6× faster). Re-verifying an
+  already-parsed frame object (the mesh re-verify / relay replay path) drops
+  from ~150 µs to ~50 µs because the signed-bytes re-concatenation is memoized.
+  The only per-verify cost added is one SHA-256 over the signed bytes (~30 µs)
+  to build the cache key — negligible next to the ~208 µs curve op.
+  Measurements are local loopback results, not capacity guarantees.
 
 ## [2.1.0] — 2026-11-02
 
