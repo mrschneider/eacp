@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] — 2026-11-10
+
+### Changed
+- **Loop-safe Ed25519 verification.** The per-frame signature curve op
+  (~74–220 µs) previously ran inline in the event loop, blocking every other
+  session (heartbeats, other agents' frames, the reaper) for its full duration
+  on every UNIQUE frame — the normal case, since each transaction is new and
+  the verify cache only helps replays. All three hot paths now offload:
+  - `AgentVerifier.verify_frame_async()` (new): cheap checks and the bounded-LRU
+    cache probe stay inline (cache hit ≈28 µs, no thread round-trip); on a
+    cache miss ONLY the curve op runs via `asyncio.to_thread`
+    (~93 µs total). Soundness is identical to `verify()` — probe and store
+    both key on `(SHA-256(signed bytes), signature)` of the data actually
+    verified, so a tampered payload can never be served a cached verdict.
+  - `relay.route_frame` dispatch (the hot path) uses
+    `await verifier.verify_frame_async(frame)`.
+  - `relay._validate_registration` is now `async`: the CA manifest signature
+    check and the proof-of-possession verify run off the loop.
+  - `client._caller_grants` is now `async` (CA mode): both curve ops
+    (CA manifest signature + caller frame signature) are offloaded.
+- Replay defense is unchanged: relay still blocks on a valid signature plus
+  the bounded-window replay check; only the surrounding crypto is loop-safe.
+
+### Validation and compatibility
+- 124 Python tests pass (+5 subtests). Seven tests that called the now-async
+  functions synchronously were updated with `asyncio.run`; no wire, signature,
+  or Rust relay changes (relay stays 1.1.1).
+- Local loopback measurements (not capacity guarantees): inline verify blocked
+  the loop 100% for the op's full duration (`bench/loop_block_proof.py`);
+  with `to_thread` the loop stays responsive (avg ~6 µs between turns, max
+  ~1.6 ms). Cache hit ≈28 µs inline; cache miss ≈93 µs with the thread
+  round-trip absorbed by the op.
+- Added `bench/profile_route_detail.py`, `bench/loop_block_proof.py` and
+  `bench/to_thread_cost.py` for reproducible measurement.
+
 ## [2.1.2] — 2026-11-08
 
 ### Changed

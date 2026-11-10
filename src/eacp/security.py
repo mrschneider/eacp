@@ -3,6 +3,7 @@ EACP Security Subsystem: PlatSec capability enforcement and Ed25519 Agent-PIN id
 """
 
 from __future__ import annotations
+import asyncio
 import hashlib
 import os
 import ssl
@@ -201,6 +202,53 @@ class AgentVerifier:
         
         signed_bytes = frame.get_signed_bytes()
         return self.verify(frame.envelope.signature, signed_bytes)
+
+    def _cache_lookup(self, signature: bytes, data: bytes) -> Optional[bool]:
+        """O(1) bounded cache probe (O(payload) for the SHA-256 digest only).
+        Returns the cached verdict, or None on a miss. Split out of verify()
+        so an async caller can probe inline and offload ONLY the curve op."""
+        key = (hashlib.sha256(data).digest(), signature)
+        with self._verify_cache_lock:
+            cached = self._verify_cache.get(key)
+            if cached is not None:
+                self._verify_cache.move_to_end(key)
+                return cached
+        return None
+
+    async def verify_frame_async(self, frame: EacpFrame) -> bool:
+        """Loop-safe frame verification for the relay dispatch path.
+
+        The Ed25519 curve op (~74-220us) is the dominant per-frame cost and,
+        run inline, BLOCKS the event loop for its full duration: a relay under
+        signed traffic stalls every other session (heartbeats, other agents'
+        frames, the reaper) for that long on every UNIQUE frame — the normal
+        case, since each transaction is new and the verify cache only helps
+        replays.
+
+        This variant keeps the cheap work inline and offloads ONLY the curve
+        op:
+          - cache HIT (replay / mesh re-verify): served inline, ~28us, no
+            thread round-trip (the common defense path stays fast);
+          - cache MISS (a genuine new frame): the curve op runs on a worker
+            thread (~93us; the ~55us to_thread round-trip is absorbed by the
+            op), so the loop is never blocked by crypto.
+
+        Soundness is identical to verify(): the probe and the store both key
+        on (SHA-256(signed bytes), signature) computed from the data actually
+        verified, so a tampered payload can never be served a cached verdict.
+        """
+        if frame.sender_pin != self.pin:
+            return False
+        if not (frame.flags & FrameFlags.FLAG_SIGNED):
+            return False
+        if not frame.envelope or not frame.envelope.signature:
+            return False
+        signed_bytes = frame.get_signed_bytes()
+        signature = frame.envelope.signature
+        cached = self._cache_lookup(signature, signed_bytes)
+        if cached is not None:
+            return cached
+        return await asyncio.to_thread(self.verify, signature, signed_bytes)
 
 
 @dataclass

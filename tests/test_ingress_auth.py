@@ -214,11 +214,11 @@ class TestIngressAuthentication(unittest.IsolatedAsyncioTestCase):
             data={"_caller_manifest": sm.to_dict()},
         )
         # valid manifest, unsigned frame -> no grants (fail closed)
-        self.assertEqual(client._caller_grants(frame), 0)
+        self.assertEqual(asyncio.run(client._caller_grants(frame)), 0)
         # same manifest, frame signed by the manifest key -> grants count
         ident.sign_frame(frame)
         self.assertEqual(
-            client._caller_grants(frame), int(Capability.CAP_SYS_ADMIN)
+            asyncio.run(client._caller_grants(frame)), int(Capability.CAP_SYS_ADMIN)
         )
 
 

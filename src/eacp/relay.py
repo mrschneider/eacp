@@ -395,7 +395,7 @@ class EacpRelay:
         except Exception:
             pass
 
-    def _validate_registration(self, frame: EacpFrame) -> Tuple[Optional[AgentVerifier], int, Optional[str]]:
+    async def _validate_registration(self, frame: EacpFrame) -> Tuple[Optional[AgentVerifier], int, Optional[str]]:
         """Registration trust chain. Returns (verifier, grants, error_detail).
 
         CA mode: verify the manifest against the CONFIGURED trusted CA key,
@@ -415,7 +415,10 @@ class EacpRelay:
                 return None, 0, f"malformed signed manifest: {e}"
             # the FIX: signature is verified against the CONFIGURED CA key;
             # the submitted ca_public_bytes is never trusted for verification
-            if not sm.is_valid(trusted_ca_public_bytes=self.enterprise_ca.public_bytes):
+            # PERF: CA signature check is a curve op — run it off the loop
+            # (registration is one-time, but it must not stall every other
+            # session's traffic while it runs).
+            if not await asyncio.to_thread(sm.is_valid, trusted_ca_public_bytes=self.enterprise_ca.public_bytes):
                 return None, 0, "manifest signature invalid under the configured Enterprise CA"
             if sm.ca_pin != self.enterprise_ca.ca_pin:
                 return None, 0, "manifest ca_pin does not match the configured Enterprise CA"
@@ -432,7 +435,8 @@ class EacpRelay:
             except Exception as e:
                 return None, 0, f"invalid manifest public key: {e}"
             # proof of possession: the frame must be signed by that key
-            if not (frame.flags & FrameFlags.FLAG_SIGNED) or not verifier.verify_frame(frame):
+            # PERF: loop-safe — curve op off the loop on a cache miss.
+            if not (frame.flags & FrameFlags.FLAG_SIGNED) or not await verifier.verify_frame_async(frame):
                 return None, 0, "no proof of possession: registration frame not signed by the manifest key"
             return verifier, int(sm.manifest.allowed_capabilities), None
 
@@ -447,7 +451,7 @@ class EacpRelay:
             return None, 0, f"invalid registration public key: {e}"
         if compute_pin(pub) != pin:
             return None, 0, "registration pub_bytes does not derive the claimed PIN"
-        if not (frame.flags & FrameFlags.FLAG_SIGNED) or not verifier.verify_frame(frame):
+        if not (frame.flags & FrameFlags.FLAG_SIGNED) or not await verifier.verify_frame_async(frame):
             return None, 0, "no proof of possession: registration frame not signed by the presented key"
         return verifier, int(frame.capabilities_mask), None
 
@@ -509,7 +513,7 @@ class EacpRelay:
                         )
                         break
                     registered_pin = frame.sender_pin
-                    verifier, grants, err_detail = self._validate_registration(frame)
+                    verifier, grants, err_detail = await self._validate_registration(frame)
                     if err_detail is not None:
                         self.metrics.platsec_denials.inc(action="register")
                         self._refuse(
@@ -751,7 +755,10 @@ class EacpRelay:
                     err_reply = frame.create_reply(status=EacpError.EACP_ERR_SIGNATURE_INVALID)
                     await sender_session.send_frame(err_reply)
                 return
-            if not verifier.verify_frame(frame):
+            # PERF: loop-safe verification — the Ed25519 curve op (cache
+            # miss, i.e. every UNIQUE frame) no longer blocks the event
+            # loop; replay hits are served inline. Same verdict, same order.
+            if not await verifier.verify_frame_async(frame):
                 # Signature invalid, drop or reply with error
                 self.metrics.platsec_denials.inc(action="route_signature")
                 if frame.msg_type == MsgType.MSG_SEND and sender_session:

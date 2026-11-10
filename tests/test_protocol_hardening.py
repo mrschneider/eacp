@@ -262,7 +262,7 @@ class TestRegistrationTrustChain(unittest.TestCase):
         d = sm.to_dict()
         d["ca_pin"] = self.trusted.ca_pin
         d["ca_public_bytes"] = self.trusted.public_bytes.hex()
-        _v, _g, err = self.relay._validate_registration(self._register_frame(d))
+        _v, _g, err = asyncio.run(self.relay._validate_registration(self._register_frame(d)))
         self.assertIsNotNone(err)
         self.assertIn("configured Enterprise CA", err)
 
@@ -270,7 +270,7 @@ class TestRegistrationTrustChain(unittest.TestCase):
         sm = self.trusted.sign_manifest(
             SecurityManifest(pin=self.ident.pin + 1, public_bytes=self.ident.public_bytes)
         )
-        _v, _g, err = self.relay._validate_registration(self._register_frame(sm.to_dict()))
+        _v, _g, err = asyncio.run(self.relay._validate_registration(self._register_frame(sm.to_dict())))
         self.assertIsNotNone(err)
         self.assertIn("pin does not match", err)
 
@@ -279,7 +279,7 @@ class TestRegistrationTrustChain(unittest.TestCase):
         sm = self.trusted.sign_manifest(
             SecurityManifest(pin=self.ident.pin, public_bytes=other.public_bytes)
         )
-        _v, _g, err = self.relay._validate_registration(self._register_frame(sm.to_dict()))
+        _v, _g, err = asyncio.run(self.relay._validate_registration(self._register_frame(sm.to_dict())))
         self.assertIsNotNone(err)
         self.assertIn("does not derive", err)
 
@@ -292,7 +292,7 @@ class TestRegistrationTrustChain(unittest.TestCase):
             )
         )
         # frame NOT signed by the manifest key
-        _v, _g, err = self.relay._validate_registration(self._register_frame(sm.to_dict(), signed=False))
+        _v, _g, err = asyncio.run(self.relay._validate_registration(self._register_frame(sm.to_dict(), signed=False)))
         self.assertIsNotNone(err)
         self.assertIn("proof of possession", err)
 
@@ -304,7 +304,7 @@ class TestRegistrationTrustChain(unittest.TestCase):
                 public_bytes=self.ident.public_bytes,
             )
         )
-        verifier, grants, err = self.relay._validate_registration(self._register_frame(sm.to_dict()))
+        verifier, grants, err = asyncio.run(self.relay._validate_registration(self._register_frame(sm.to_dict())))
         self.assertIsNone(err)
         self.assertIsNotNone(verifier)
         self.assertEqual(grants, int(Capability.CAP_DISK_READ))
@@ -362,10 +362,10 @@ class TestClaimsBoundedByGrants(HardenedRelayTestBase):
             transaction_id=1, data={"_caller_manifest": sm.to_dict()},
         )
         # SEC-01 PoP: valid manifest but UNSIGNED frame -> no grants
-        self.assertEqual(client._caller_grants(frame), 0)
+        self.assertEqual(asyncio.run(client._caller_grants(frame)), 0)
         # frame signed by the manifest key -> grants count
         ident.sign_frame(frame)
-        self.assertEqual(client._caller_grants(frame), int(Capability.CAP_NET_RAW))
+        self.assertEqual(asyncio.run(client._caller_grants(frame)), int(Capability.CAP_NET_RAW))
         frame = EacpFrame(
             msg_type=MsgType.MSG_SEND, verb="t", sender_pin=ident.pin, target_pin=2,
             transaction_id=2, data={"_caller_manifest": sm.to_dict()},
@@ -378,10 +378,10 @@ class TestClaimsBoundedByGrants(HardenedRelayTestBase):
                              public_bytes=ident.public_bytes)
         )
         frame.data["_caller_manifest"] = sm_bad.to_dict()
-        self.assertEqual(client._caller_grants(frame), 0)
+        self.assertEqual(asyncio.run(client._caller_grants(frame)), 0)
         # no manifest at all in CA mode -> 0
         frame.data = {}
-        self.assertEqual(client._caller_grants(frame), 0)
+        self.assertEqual(asyncio.run(client._caller_grants(frame)), 0)
 
 
 # --------------------------------------------------------------------------

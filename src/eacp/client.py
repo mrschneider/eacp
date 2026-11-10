@@ -520,7 +520,7 @@ class RSessionBase:
         except Exception:  # pragma: no cover - defensive
             pass
 
-    def _caller_grants(self, frame: EacpFrame) -> Optional[int]:
+    async def _caller_grants(self, frame: EacpFrame) -> Optional[int]:
         """Authenticated caller grants (CA mode only).
 
         Returns the CA-attested allowed capabilities of the caller — verified
@@ -529,6 +529,10 @@ class RSessionBase:
         missing attestation is NOT a wildcard). Returns None when no CA is
         configured, meaning no attestation layer exists (relay-side
         registration grants still bound claims in that deployment).
+
+        PERF: both curve ops (CA manifest signature + the caller's frame
+        signature) are offloaded so a signed request in CA mode does not
+        block the agent's event loop for ~150us+.
         """
         if self.enterprise_ca is None:
             return None
@@ -539,7 +543,7 @@ class RSessionBase:
         except Exception as e:
             logger.warning(f"malformed caller manifest from {frame.sender_pin}: {e}")
             return 0
-        if not sm.is_valid(trusted_ca_public_bytes=self.enterprise_ca.public_bytes):
+        if not await asyncio.to_thread(sm.is_valid, trusted_ca_public_bytes=self.enterprise_ca.public_bytes):
             return 0
         if sm.manifest.pin != frame.sender_pin:
             return 0
@@ -553,7 +557,8 @@ class RSessionBase:
         if not (frame.flags & FrameFlags.FLAG_SIGNED):
             return 0
         try:
-            if not AgentVerifier.from_public_bytes(pub).verify_frame(frame):
+            verifier = AgentVerifier.from_public_bytes(pub)
+            if not await asyncio.to_thread(verifier.verify_frame, frame):
                 return 0
         except Exception:
             return 0
@@ -588,7 +593,7 @@ class RSessionBase:
                 # PlatSec capability check — three layers: authenticated
                 # caller grants (CA mode), the request's attenuation, and
                 # this agent's own policy
-                caller_grants = self._caller_grants(frame)
+                caller_grants = await self._caller_grants(frame)
                 if caller_grants is not None and (frame.capabilities_mask & ~caller_grants):
                     await self.reply(
                         frame,
