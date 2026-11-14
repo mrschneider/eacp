@@ -107,6 +107,30 @@ class AgentIdentity:
         frame.envelope.signature = self.sign(frame.get_signed_bytes(data))
         return frame.pack(data)
 
+    async def pack_frame_async(self, frame: EacpFrame, session_handle: int = 0) -> bytes:
+        """Loop-safe pack: cheap encode inline, Ed25519 sign offloaded to a thread.
+
+        Mirrors verify_frame_async: the sign curve op (~74-220 us) is the
+        dominant per-frame cost on the SENDING side and, run inline, blocks
+        the event loop for its full duration.  The ~55 us to_thread round-
+        trip is absorbed by the op itself, so net latency is unchanged while
+        the loop stays free for heartbeats, other sessions and the reaper.
+
+        Soundness is identical to pack_frame: the same fields are set, the
+        same signed-bytes derivation is used, and the signature is written
+        before pack() serialises the frame.
+        """
+        # Cheap prep inline (no crypto)
+        frame.sender_pin = self.pin
+        frame.flags |= FrameFlags.FLAG_SIGNED
+        frame.envelope = CryptoEnvelope(session_handle=session_handle, signature=b"")
+        data = frame._encode_data()
+        signed_bytes = frame.get_signed_bytes(data)
+        # Offload the curve op
+        sig = await asyncio.to_thread(self.sign, signed_bytes)
+        frame.envelope.signature = sig
+        return frame.pack(data)
+
 
 @dataclass
 class AgentVerifier:

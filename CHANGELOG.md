@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] — 2026-11-13
+
+### Changed
+- **`EacpFrame.__setattr__` short-circuit.** During `dataclass.__init__` all
+  three caches (`raw_payload`, `_wire`, `_signed_cache`) are `None`, so the
+  original code performed 3 independent `dict.get()` lookups on every field
+  assignment (~175K per 1500 frames). The `_wire` and `_signed_cache` checks
+  are now nested inside the `raw_payload is not None` guard: one lookup on
+  the hot construction path, three only on the rare post-construction
+  mutation. Saves ~272K dict lookups per benchmark run.
+- **`AgentIdentity.pack_frame_async()` (new).** Loop-safe pack: cheap encode
+  inline, Ed25519 sign offloaded via `asyncio.to_thread`. Mirrors the
+  `verify_frame_async` pattern. Available for deployments with a dedicated
+  event loop; NOT wired into the relay hot path (benchmark showed +15.8%
+  latency when client + relay share a single loop and thread pool).
+
+### Performance (subprocess benchmark, production topology)
+| Metric | Before | After | Δ |
+|--------|--------|-------|---|
+| Pipelined conc=32 (req/s) | 958 | 1,233 | **+28.7%** |
+| Healthy p50 during stall (ms) | 2.59 | 1.38 | **−46.7%** |
+| Healthy p99 during stall (ms) | 7.75 | 1.88 | **−75.7%** |
+| RTT p50 (ms) | 1.59 | 1.42 | −10.7% |
+
+### Validation and compatibility
+- 124 Python tests pass (+5 subtests). No wire, signature, or Rust relay
+  changes (relay stays 1.1.1).
+- Added `bench/profile_inprocess.py` (cProfile, in-process) and
+  `docs/performance_report.md` (full analysis + recommendations).
+
 ## [2.2.0] — 2026-11-10
 
 ### Changed

@@ -118,15 +118,19 @@ class EacpFrame:
         verification must still SEE tampering (test_frame_signing_and_
         verification re-encodes mutated fields), while the unmodified relay
         verify/forward path keeps the zero-re-encode fast paths in
-        get_signed_bytes / pack."""
+        get_signed_bytes / pack.
+
+        PERF: during dataclass __init__ all three caches are None, so the
+        first d.get("raw_payload") check short-circuits and we skip the
+        other two lookups entirely (saves 2 dict lookups × ~175K calls)."""
         if name not in ("raw_payload", "_wire", "_signed_cache"):
             d = self.__dict__
             if d.get("raw_payload") is not None:
                 object.__setattr__(self, "raw_payload", None)
-            if d.get("_wire") is not None:
-                object.__setattr__(self, "_wire", None)
-            if d.get("_signed_cache") is not None:
-                object.__setattr__(self, "_signed_cache", None)
+                if d.get("_wire") is not None:
+                    object.__setattr__(self, "_wire", None)
+                if d.get("_signed_cache") is not None:
+                    object.__setattr__(self, "_signed_cache", None)
         object.__setattr__(self, name, value)
 
     def is_pulse(self) -> bool:
