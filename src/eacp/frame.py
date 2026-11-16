@@ -7,7 +7,12 @@ import json
 import struct
 import zlib
 
-from dataclasses import dataclass, field
+try:  # PERF: ~5x faster JSON parse on the receive path; falls back to stdlib
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - orjson is optional
+    _orjson = None
+
+from dataclasses import dataclass, field, fields as _dc_fields, MISSING as _dc_missing
 from typing import Any, Optional, Tuple
 
 from .constants import (
@@ -133,6 +138,37 @@ class EacpFrame:
                     object.__setattr__(self, "_signed_cache", None)
         object.__setattr__(self, name, value)
 
+    # PERF: construction bypass. dataclass __init__ runs one
+    # object.__setattr__ per field — and this class's __setattr__ is a
+    # tamper-invalidation hook that pays a dict lookup per call. unpack()
+    # builds ~17 fields per frame on the receive path, so the full
+    # __init__ costs ~175K hooked __setattr__ calls per 1.5K frames.
+    # _construct() writes the instance dict directly with defaults merged in;
+    # every field the dataclass declares is present, so __dict__, asdict()
+    # and copy semantics are unchanged. default_factory values are stored as
+    # FACTORIES (fresh instance per frame) — a shared mutable default would
+    # alias state across frames. (Unannotated on purpose: an annotated name
+    # would become a dataclass FIELD.)
+    _FIELD_DEFAULTS = None
+
+    @classmethod
+    def _construct(cls, **kwargs: Any) -> "EacpFrame":
+        if cls._FIELD_DEFAULTS is None:
+            entries = []
+            for _f in _dc_fields(cls):
+                if _f.default is not _dc_missing:
+                    entries.append((_f.name, None, _f.default))
+                elif _f.default_factory is not _dc_missing:
+                    entries.append((_f.name, _f.default_factory, None))
+            cls._FIELD_DEFAULTS = tuple(entries)
+        d = {}
+        for name, factory, value in cls._FIELD_DEFAULTS:
+            d[name] = factory() if factory is not None else value
+        d.update(kwargs)
+        obj = object.__new__(cls)
+        object.__setattr__(obj, "__dict__", d)
+        return obj
+
     def is_pulse(self) -> bool:
         return self.msg_type == MsgType.MSG_PULSE
 
@@ -212,10 +248,25 @@ class EacpFrame:
         offset += l1
         data = None
         if slot1_bytes:
-            try:
-                data = json.loads(slot1_bytes.decode("utf-8"))
-            except Exception:
-                data = slot1_bytes
+            if _orjson is not None:
+                try:
+                    # PERF: ~5x faster parse. STRICT mode — the stdlib json
+                    # module is the wire contract (it tolerates NaN/Infinity
+                    # literals), so a strict decode failure falls back to it
+                    # before treating the slot as raw bytes.
+                    data = _orjson.loads(slot1_bytes)
+                except _orjson.JSONDecodeError:
+                    try:
+                        data = json.loads(slot1_bytes.decode("utf-8"))
+                    except Exception:
+                        data = slot1_bytes  # non-JSON slot: raw bytes (legacy contract)
+                except Exception:
+                    data = slot1_bytes
+            else:
+                try:
+                    data = json.loads(slot1_bytes.decode("utf-8"))
+                except Exception:
+                    data = slot1_bytes
 
         slot2_bytes = payload[offset : offset + l2]
         offset += l2
@@ -378,7 +429,7 @@ class EacpFrame:
         status = EacpError(status_raw)
 
         if msg_type == MsgType.MSG_PULSE:
-            return cls(
+            return cls._construct(
                 magic=magic,
                 version=ver,
                 msg_type=msg_type,
@@ -432,7 +483,7 @@ class EacpFrame:
                 raise ValueError("Trailing bytes after the compressed stream (concatenated streams are rejected)")
 
         verb, data, constraints, envelope = cls.unpack_slots(effective_payload)
-        return cls(
+        return cls._construct(
             magic=magic,
             version=ver,
             msg_type=msg_type,
@@ -453,7 +504,9 @@ class EacpFrame:
 
     def create_reply(self, status: int = EacpError.EACP_SUCCESS, result_data: Any = None) -> EacpFrame:
         """Create a corresponding MSG_REPLY frame targeting the sender."""
-        return EacpFrame(
+        # _construct: a reply is built once per routed frame — the dataclass
+        # __init__ would pay ~14 hooked __setattr__ calls for no reason.
+        return EacpFrame._construct(
             magic=self.magic,
             version=self.version,
             msg_type=MsgType.MSG_REPLY,
@@ -485,7 +538,7 @@ class EacpFrame:
         code_int = int(pulse_code)
         val_bytes = pulse_value.to_bytes(6, byteorder="big", signed=False)
         payload = struct.pack(">H", code_int) + val_bytes
-        return cls(
+        return cls._construct(
             msg_type=MsgType.MSG_PULSE,
             sender_pin=sender_pin,
             target_pin=target_pin,

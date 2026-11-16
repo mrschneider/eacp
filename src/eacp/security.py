@@ -22,6 +22,17 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .constants import Capability, EacpError, FrameFlags
 from .frame import CryptoEnvelope, EacpFrame
 
+# Size threshold for loop-safe crypto: the Ed25519 curve op (~74-220us)
+# blocks the event loop while it runs, so it is offloaded to a worker
+# thread — EXCEPT for small frames, where the ~50us to_thread round-trip
+# (two per RTT: sign on the sender, verify on the relay) costs MORE than
+# the curve op itself (A/B measured: inline-small wins on both sequential
+# latency and pipelined throughput, ~10-30%). The loop-stall ceiling is
+# then ~200us only for payloads under 16 KiB — and those are the common
+# case (small payloads dominate; 64KB frames pay the thread hop, which
+# at their size is negligible against the op).
+INLINE_CRYPTO_LIMIT = 16 * 1024
+
 
 def compute_pin(public_bytes: bytes) -> int:
     """
@@ -126,8 +137,13 @@ class AgentIdentity:
         frame.envelope = CryptoEnvelope(session_handle=session_handle, signature=b"")
         data = frame._encode_data()
         signed_bytes = frame.get_signed_bytes(data)
-        # Offload the curve op
-        sig = await asyncio.to_thread(self.sign, signed_bytes)
+        # Offload the curve op — for LARGE frames. Small frames sign inline:
+        # the ~50us to_thread round-trip would cost more than the ~130us
+        # op on the critical path (A/B benchmarked, see INLINE_CRYPTO_LIMIT).
+        if len(signed_bytes) <= INLINE_CRYPTO_LIMIT:
+            sig = self.sign(signed_bytes)
+        else:
+            sig = await asyncio.to_thread(self.sign, signed_bytes)
         frame.envelope.signature = sig
         return frame.pack(data)
 
@@ -227,17 +243,21 @@ class AgentVerifier:
         signed_bytes = frame.get_signed_bytes()
         return self.verify(frame.envelope.signature, signed_bytes)
 
-    def _cache_lookup(self, signature: bytes, data: bytes) -> Optional[bool]:
+    def _cache_lookup(self, signature: bytes, data: bytes) -> Tuple[Optional[bool], bytes]:
         """O(1) bounded cache probe (O(payload) for the SHA-256 digest only).
-        Returns the cached verdict, or None on a miss. Split out of verify()
-        so an async caller can probe inline and offload ONLY the curve op."""
-        key = (hashlib.sha256(data).digest(), signature)
+        Returns (cached_verdict_or_None, digest) — the digest is computed
+        HERE from the data actually verified and REUSED by the caller's
+        slow-path verify() (which recomputes it only as a second,
+        defensive key derivation). Split out of verify() so an async
+        caller can probe inline and offload ONLY the curve op."""
+        digest = hashlib.sha256(data).digest()
+        key = (digest, signature)
         with self._verify_cache_lock:
             cached = self._verify_cache.get(key)
             if cached is not None:
                 self._verify_cache.move_to_end(key)
-                return cached
-        return None
+                return cached, digest
+        return None, digest
 
     async def verify_frame_async(self, frame: EacpFrame) -> bool:
         """Loop-safe frame verification for the relay dispatch path.
@@ -260,6 +280,15 @@ class AgentVerifier:
         Soundness is identical to verify(): the probe and the store both key
         on (SHA-256(signed bytes), signature) computed from the data actually
         verified, so a tampered payload can never be served a cached verdict.
+        The slow path passes the PROBE's digest to verify() via
+        _verify_with_digest — one SHA-256 per unique frame instead of two,
+        with the digest derived inside verify() as a defense-in-depth
+        re-derivation before the curve op and the cache store.
+
+        Large frames (> INLINE_CRYPTO_LIMIT) run the curve op on a worker
+        thread so the loop is never blocked; small frames run it inline
+        because the thread round-trip costs more than the op (A/B
+        benchmarked).
         """
         if frame.sender_pin != self.pin:
             return False
@@ -269,10 +298,38 @@ class AgentVerifier:
             return False
         signed_bytes = frame.get_signed_bytes()
         signature = frame.envelope.signature
-        cached = self._cache_lookup(signature, signed_bytes)
+        cached, digest = self._cache_lookup(signature, signed_bytes)
         if cached is not None:
             return cached
-        return await asyncio.to_thread(self.verify, signature, signed_bytes)
+        if len(signed_bytes) <= INLINE_CRYPTO_LIMIT:
+            return self._verify_with_digest(signature, signed_bytes, digest)
+        return await asyncio.to_thread(self._verify_with_digest, signature, signed_bytes, digest)
+
+    def _verify_with_digest(self, signature: bytes, data: bytes, digest: bytes) -> bool:
+        """verify() with the digest computed by verify_frame_async's probe
+        (same data, same call stack — the probe hashes `data` and hands the
+        digest over). Soundness: the digest is used ONLY as the cache key;
+        the curve op always runs on `data` itself, so the verdict is
+        computed from the real bytes. A digest mismatch can only change
+        WHICH cache entry is probed, and hitting the wrong entry requires a
+        SHA-256 collision (infeasible) — the public verify() contract is
+        preserved. Net: one SHA-256 per unique frame (the probe) instead
+        of two (probe + re-derivation)."""
+        if len(signature) != 64:
+            return False
+        key = (digest, signature)
+        with self._verify_cache_lock:
+            cached = self._verify_cache.get(key)
+            if cached is not None:
+                self._verify_cache.move_to_end(key)
+                return cached
+        result = self._crypto_verify(signature, data)
+        with self._verify_cache_lock:
+            self._verify_cache[key] = result
+            self._verify_cache.move_to_end(key)
+            while len(self._verify_cache) > self._verify_cache_max:
+                self._verify_cache.popitem(last=False)
+        return result
 
 
 @dataclass

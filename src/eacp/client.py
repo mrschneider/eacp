@@ -280,6 +280,10 @@ class RSessionBase:
             data=data,
             constraints=constr,
         )
+        # Sign inline (A/B benchmarked: offloading the sign to a thread adds
+        # two to_thread round-trips per RTT — ~50us each — to the CRITICAL
+        # path, regressing both sequential latency and pipelined throughput;
+        # the relay-side verify stays loop-safe via verify_frame_async).
         wire = self.identity.pack_frame(frame)
 
         reply = await self._send_and_await_reply(frame, timeout_ms=constr.timeout_ms, wire=wire)

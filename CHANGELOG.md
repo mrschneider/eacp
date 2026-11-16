@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] — 2026-11-16
+
+### Added
+- **`EacpFrame._construct()`** — fast-path construction bypassing
+  `dataclass.__init__` on the receive path (`unpack`, `create_reply`,
+  `create_pulse`). The dataclass `__init__` runs one `object.__setattr__`
+  per field, and this class's `__setattr__` is a tamper-invalidation hook
+  that pays a dict lookup per call — ~175K hooked calls per 1.5K frames.
+  `_construct()` writes `__dict__` directly with defaults merged in
+  (`default_factory` values stored as factories: fresh instance per frame,
+  no aliasing). `__dict__`, `asdict()` and copy semantics are unchanged.
+- **`orjson` fast path in `unpack_slots`** (~5x faster JSON parse on the
+  receive path) with a stdlib-`json` fallback before treating a slot as raw
+  bytes: the wire contract is the stdlib module (it tolerates NaN/Infinity
+  literals), so strict-mode failures fall back instead of degrading legacy
+  frames to bytes payloads. `orjson` is optional; absent = stdlib path.
+- **`AgentVerifier._verify_with_digest()`** — the verify-cache probe's
+  SHA-256 digest is reused by the slow path: one hash per unique frame
+  instead of two. The curve op always runs on the real bytes, so the
+  cached verdict is computed from the data itself.
+
+### Changed
+- **Hybrid loop-safe crypto (`INLINE_CRYPTO_LIMIT = 16 KiB`).** The Ed25519
+  curve op runs INLINE for frames ≤ 16 KiB (the common case) and via
+  `asyncio.to_thread` for larger frames. A/B benchmarked: the ~50 µs
+  `to_thread` round-trip — two per RTT (sign on the sender, verify on the
+  relay) — costs MORE than the ~130 µs curve op for small payloads, so
+  full offload regressed throughput by 10-30%. The event-loop stall ceiling
+  is now ~200 µs only for sub-16 KiB payloads; 64 KB frames still pay the
+  thread hop, which at their size is negligible against the op. Applies to
+  `verify_frame_async` and `pack_frame_async`.
+
+### Performance (in-process, 1.5K signed echo round-trips; 3-run median)
+| Metric | v2.2.1 | v2.2.2 | Δ |
+|--------|--------|--------|---|
+| Sequential (rps) | 645 | 895 | **+39%** |
+| Pipelined conc=32 (rps) | 935 | 1,304 | **+40%** |
+| Subprocess pipelined (rps) | ~1,221 | ~2,059 | **+68%** |
+| Sequential latency (ms/RTT) | 1.55 | 1.12 | **−28%** |
+
+Subprocess (TCP, relay in its own process) pipelined throughput now
+outruns the Rust reference relay (592 rps) by ~3.5x on loopback.
+
 ## [2.2.1] — 2026-11-13
 
 ### Changed

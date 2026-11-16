@@ -14,7 +14,7 @@ from eacp.budget import PayloadTokenMeter
 from eacp.client import RSessionBase
 from eacp.constants import EacpError
 from eacp.dtn import Bundle, CustodyStore
-from eacp.frame import EacpFrame, ExecutionConstraints
+from eacp.frame import CryptoEnvelope, EacpFrame, ExecutionConstraints
 from eacp.ledger import AuditLedger, LedgerIntegrityError
 from eacp.qos import OwnershipArbitrator
 from eacp.relay import EacpRelay
@@ -94,6 +94,45 @@ class SerializationTests(unittest.TestCase):
         self.assertFalse(verifier.verify_frame(frame))
         self.assertTrue(verifier.verify_frame(EacpFrame.unpack(wire)))
         self.assertNotEqual(frame.pack(), wire)
+
+    def test_construct_bypass_defaults_match_dataclass_init(self):
+        # _construct() must be semantically identical to EacpFrame():
+        # every field present, defaults are INSTANCES (not factories), and
+        # each frame gets its own mutable default (no aliasing).
+        a = EacpFrame()
+        b = EacpFrame._construct()
+        self.assertEqual(a.__dict__.keys(), b.__dict__.keys())
+        for name in a.__dict__:
+            self.assertEqual(a.__dict__[name], b.__dict__[name], name)
+        self.assertNotIsInstance(b.constraints, type)
+        self.assertIsInstance(b.constraints, ExecutionConstraints)
+        self.assertIsInstance(b.envelope, CryptoEnvelope)
+        self.assertIsNot(b.constraints, a.constraints)
+        self.assertIsNot(b.envelope, a.envelope)
+        # pulse path (no constraints passed) stays packable + round-trips
+        pulse = EacpFrame.create_pulse(sender_pin=1, target_pin=2, pulse_code=1)
+        self.assertNotIsInstance(pulse.constraints, type)
+        rt = EacpFrame.unpack(pulse.pack())
+        self.assertEqual(rt.get_pulse_data(), (1, 0))
+
+    def test_slot1_strict_json_fallback_matches_stdlib(self):
+        # The wire contract is the STDLIB json module: it tolerates
+        # NaN/Infinity literals (non-strict). A faster strict parser must
+        # fall back to stdlib on those BEFORE treating the slot as raw
+        # bytes, or legacy frames would silently degrade to bytes payloads.
+        import math
+        for value in ({"n": float("nan")}, {"i": float("inf")}, float("nan")):
+            with self.subTest(value=value):
+                f = EacpFrame(verb="echo", data=value)
+                rt = EacpFrame.unpack(f.pack())
+                if isinstance(value, dict):
+                    self.assertIsInstance(rt.data, dict)
+                    self.assertTrue(math.isnan(rt.data["n"]) if "n" in value else math.isinf(rt.data["i"]))
+                else:
+                    self.assertTrue(math.isnan(rt.data))
+        # genuinely non-JSON slots stay raw bytes (legacy contract)
+        rt = EacpFrame.unpack(EacpFrame(verb="echo", data=b"\x00\xff raw").pack())
+        self.assertEqual(rt.data, b"\x00\xff raw")
 
     def test_meter_preserves_whitespace_unicode_and_rounding(self):
         meter = PayloadTokenMeter()
