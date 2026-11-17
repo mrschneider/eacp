@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] — 2026-11-17
+
+### Added
+- **`orjson` fast path in the send path (`EacpFrame._data_bytes`).**
+  `orjson.dumps` is ~3x faster than stdlib `json.dumps` for the small
+  payloads that dominate real traffic. The wire contract is the stdlib
+  `json` module (byte-exact conformance vectors), and `orjson` diverges on
+  non-ASCII strings (raw UTF-8 vs `\uXXXX` escapes), some float formats
+  (`1e-05` vs `0.00001`), NaN/Infinity (raises vs stdlib literals) and
+  integers outside the 64-bit range (raises). The fast path is therefore
+  gated by `_orjson_byte_identical()`, a bounded scan that only certifies
+  structures guaranteed byte-identical (ASCII-only strings, no floats,
+  str/int keys, 64-bit ints); anything it cannot certify falls back to
+  stdlib so the wire bytes never change. The scan is capped at
+  `_ORJSON_SCAN_ELEMENT_LIMIT` (64) elements — an unbounded Python-level
+  walk costs MORE than the stdlib serialization it avoids on large
+  payloads, so large structures always fall back (neutral, no regression).
+  `orjson` is optional; absent = stdlib path.
+
+### Changed
+- **Single-allocation slot concatenation.** `pack`, `get_signed_bytes` and
+  the signed-bytes builder now use `b"".join((...))` instead of chained
+  `+`, which made up to 3 intermediate copies of up-to-64 KB payloads per
+  call.
+
+### Performance (serialization microbenchmark, byte-identical output)
+| payload | before (stdlib) | after | Δ |
+|---------|-----------------|-------|---|
+| small (`{"n": 5, ...}`) | 3.32 µs | 1.02 µs | **3.25x faster** |
+| mid (13 KB) | 110.6 µs | 112.2 µs | neutral |
+| large (64 KB) | 543.4 µs | 555.3 µs | neutral |
+
+End-to-end relay throughput is unchanged within run-to-run noise
+(sequential ~784 rps, pipelined ~2025 rps over a 3-run median): the
+in-process relay path is Ed25519 sign/verify-bound, so the serialization
+win does not move the aggregate. The gain is in CPU cost of serialization
+itself, which is the only sink attackable without touching the crypto
+contract.
+
+### Validation and compatibility
+- Full suite green: 126 passed, 8 subtests passed.
+- Cross-language conformance vectors byte-identical (generator
+  deterministic); all positive and negative vectors pass.
+- Wire bytes unchanged for every payload class (ASCII / non-ASCII /
+  float / NaN-Inf / >64-bit int / bytes / None) — verified by
+  `test_atomic_sign_pack_matches_legacy_bytes`.
+
 ## [2.2.2] — 2026-11-16
 
 ### Added

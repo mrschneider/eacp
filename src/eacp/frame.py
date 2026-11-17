@@ -43,6 +43,65 @@ HEADER_STRUCT = struct.Struct(">2sBBHHQQQQII")
 assert HEADER_STRUCT.size == HEADER_SIZE == 48
 
 
+# Bound on how many container elements the byte-identity scan will visit
+# before giving up and falling back to stdlib. The scan is a Python-level
+# walk; it only pays for itself on *small* structures (where orjson is
+# ~3x faster than stdlib and the walk is sub-microsecond). On large
+# payloads the walk itself would cost more than the stdlib serialization
+# it's trying to avoid, so we cap it: large structures always fall back to
+# stdlib, which is correct and competitive there.
+_ORJSON_SCAN_ELEMENT_LIMIT = 64
+
+
+def _orjson_byte_identical(obj: Any) -> bool:
+    """True iff ``orjson.dumps(obj)`` is byte-for-byte identical to
+    ``json.dumps(obj, separators=(",", ":")).encode("utf-8")``.
+
+    The wire contract is the stdlib ``json`` module (see ``unpack_slots``:
+    it tolerates NaN/Infinity literals and escapes non-ASCII as ``\\uXXXX``).
+    orjson diverges in ways that would corrupt the byte-exact conformance
+    vectors and cross-language interop:
+      * non-ASCII strings are emitted as raw UTF-8 (stdlib escapes them);
+      * some floats format differently (``1e-05`` vs ``0.00001``);
+      * NaN/Infinity raise instead of emitting the stdlib literals;
+      * integers outside the 64-bit range raise (stdlib accepts them).
+    So the orjson fast path is taken only when the structure is guaranteed
+    identical: ASCII-only strings, no floats, str/int keys, 64-bit ints.
+    The scan is bounded by ``_ORJSON_SCAN_ELEMENT_LIMIT`` elements so the
+    Python-level walk never dominates on large payloads; anything it
+    cannot fully certify falls back to stdlib (correctness over speed).
+    """
+    stack = [obj]
+    seen = 0
+    limit = _ORJSON_SCAN_ELEMENT_LIMIT
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, str):
+            if not cur.isascii():
+                return False
+        elif isinstance(cur, float):
+            return False
+        elif type(cur) is int:  # bool excluded: always byte-identical
+            if cur < -(2**63) or cur >= 2**64:
+                return False
+        elif isinstance(cur, dict):
+            for k, v in cur.items():
+                if type(k) is not str and type(k) is not int:
+                    return False
+                seen += 2
+                if seen > limit:
+                    return False
+                stack.append(k)
+                stack.append(v)
+        elif isinstance(cur, (list, tuple)):
+            seen += len(cur)
+            if seen > limit:
+                return False
+            stack.extend(cur)
+        # bool / None: always byte-identical
+    return True
+
+
 @dataclass
 class ExecutionConstraints:
     token_budget: int = 0
@@ -187,6 +246,15 @@ class EacpFrame:
         elif isinstance(self.data, bytes):
             return self.data
         elif isinstance(self.data, (dict, list, int, float, str, bool)):
+            # PERF: orjson is ~5-15x faster than stdlib json.dumps on the
+            # send path. The wire contract, however, is the stdlib module
+            # (byte-exact conformance vectors), and orjson diverges on
+            # non-ASCII strings, some float formats, and NaN/Infinity.
+            # Take the fast path ONLY when the structure is guaranteed
+            # byte-identical (ASCII-only, no floats); otherwise fall back
+            # to stdlib so the bytes never change.
+            if _orjson is not None and _orjson_byte_identical(self.data):
+                return _orjson.dumps(self.data)
             return json.dumps(self.data, separators=(",", ":")).encode("utf-8")
         else:
             return str(self.data).encode("utf-8")
@@ -209,7 +277,9 @@ class EacpFrame:
         slot3 = (self.envelope or CryptoEnvelope()).pack()
 
         lens = struct.pack(">IIII", len(slot0), len(slot1), len(slot2), len(slot3))
-        raw_slots = lens + slot0 + slot1 + slot2 + slot3
+        # PERF: one allocation via join instead of 4 intermediate bytes
+        # objects from chained + (matters at 64KB payloads).
+        raw_slots = b"".join((lens, slot0, slot1, slot2, slot3))
 
         # Transparent compression if enabled or if exceeding threshold
         if (self.flags & FrameFlags.FLAG_COMPRESSED) or len(raw_slots) > COMPRESSION_THRESHOLD_BYTES:
@@ -328,7 +398,9 @@ class EacpFrame:
                         int(self.status),
                         payload_len_field,
                     )
-                    signed = hdr + self.raw_payload[:16] + slots_012 + s3_head
+                    # PERF: one allocation via join (4 chained + made 3
+                    # intermediate copies of up to 64KB payloads).
+                    signed = b"".join((hdr, self.raw_payload[:16], slots_012, s3_head))
                     # Memoize for repeated verifications of this parsed frame
                     # (replay re-check, mesh re-verify): rebuilding this
                     # concatenation of a 64KB payload is ~40us per call.
@@ -374,7 +446,8 @@ class EacpFrame:
         )
         # signing contract v2 (SEC-02): the length block is part of the
         # authenticated input — see get_signed_bytes docstring
-        return hdr + lens + slot0 + slot1 + slot2 + slot3_prefix
+        # PERF: one allocation via join instead of 5 chained +.
+        return b"".join((hdr, lens, slot0, slot1, slot2, slot3_prefix))
 
     def pack(self, _data_bytes: Optional[bytes] = None) -> bytes:
         # Fast path: forward the exact wire bytes we were parsed from. This

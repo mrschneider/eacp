@@ -68,6 +68,19 @@ class VerifyCacheTests(unittest.TestCase):
 
 
 class SerializationTests(unittest.TestCase):
+    @staticmethod
+    def _stdlib_dumps_expected(value):
+        # How many stdlib json.dumps calls the send path must make for
+        # this payload. None/bytes never serialize; orjson takes over
+        # when its output is guaranteed byte-identical to stdlib
+        # (ASCII-only strings, no floats, str/int keys); everything else
+        # (non-ASCII, floats, NaN/Inf) must fall back to stdlib exactly
+        # once.
+        if value is None or isinstance(value, bytes):
+            return 0
+        from eacp.frame import _orjson_byte_identical
+        return 0 if _orjson_byte_identical(value) else 1
+
     def test_atomic_sign_pack_matches_legacy_bytes(self):
         ident = AgentIdentity.generate()
         values = [None, b'raw', {'text': '漢字', 'n': 1e-7},
@@ -80,7 +93,7 @@ class SerializationTests(unittest.TestCase):
                 expected = old.pack()
                 with patch('eacp.frame.json.dumps', wraps=json.dumps) as dumps:
                     actual = ident.pack_frame(new, session_handle=19)
-                    self.assertEqual(dumps.call_count, 0 if value is None or isinstance(value, bytes) else 1)
+                    self.assertEqual(dumps.call_count, self._stdlib_dumps_expected(value))
                 self.assertEqual(actual, expected)
                 verifier = AgentVerifier.from_public_bytes(ident.public_bytes)
                 self.assertTrue(verifier.verify_frame(EacpFrame.unpack(actual)))
