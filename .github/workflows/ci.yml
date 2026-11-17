@@ -13,22 +13,20 @@ jobs:
   test:
     name: Test py${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # 45 min, not 15: the queued time counts against the job timeout, and
-    # the macOS arm64 pool is capacity-starved — 4 cells asking for 4
-    # runners at once lost the 15-minute race and were CANCELLED by the
-    # runner policy ("The job was not acquired by Runner of type hosted
-    # even after multiple attempts"), which reddened the run for reasons
-    # unrelated to the code. The watchdog runner (tools/run_tests_fh.py)
-    # is the real hang guard — it exits 70 with a readable stack.
+    # 45 min: the queued time counts against the job timeout, and a cell
+    # that waits for a scarce runner must not be cut short. The real hang
+    # guard is tools/run_tests_fh.py (it exits 70 with a readable stack).
     timeout-minutes: 45
-    # macOS is best-effort: it is a secondary platform for this protocol
-    # and its arm64 runners are scarce. ubuntu + windows + the Rust relay
-    # + the interop job stay blocking, so a real regression still fails.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS lives in ci-macos.yml: its arm64 runner pool is capacity
+        # starved, and a cell that cannot get a runner is CANCELLED by
+        # GitHub's acquisition policy — and a cancelled job is not a
+        # "failure", so a per-job continue-on-error cannot absorb it.
+        # Keeping macOS in its own workflow keeps it visible without
+        # letting it redden the push/PR gate.
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4

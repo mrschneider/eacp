@@ -1,0 +1,71 @@
+name: CI (macOS, best-effort)
+
+# The macOS matrix, split out of ci.yml on purpose.
+#
+# Why: macos-latest is an arm64 image and the hosted arm64 pool on this
+# account is capacity-starved. When four macOS cells ask for four runners
+# at once, three of them never get one and GitHub CANCELS them ("The job
+# was not acquired by Runner of type hosted even after multiple attempts"
+# / "Due to capacity constraints, jobs targeting macOS arm64 runners may
+# experience longer queue times"). A cancelled job is not a failed job, so
+# a per-job `continue-on-error` cannot absorb it and the workflow would
+# still go red — for reasons that have nothing to do with the protocol.
+#
+# So: macOS runs here, on its own workflow, with a workflow-level
+# continue-on-error. It stays visible as a check and it still reports
+# honestly, but it never blocks a push or a PR. The blocking gate is
+# ci.yml: ubuntu + windows (3.10-3.13), the Rust relay, the Python<->Rust
+# interop job and the distribution build.
+#
+# When the arm64 pool recovers, drop this file and put `macos-latest`
+# back into the ci.yml matrix — the split was a capacity workaround, not
+# a coverage decision.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+# A cancelled or failed macOS cell must not fail this workflow.
+continue-on-error: true
+
+jobs:
+  test:
+    name: Test py${{ matrix.python-version }} on macos-latest
+    runs-on: macos-latest
+    # The queue wait counts against the timeout; give the scarce arm64
+    # runner room to show up.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install cryptography
+
+      - name: Run test suite
+        run: python tools/run_tests_fh.py
+
+      - name: Cross-language conformance vectors
+        run: |
+          python conformance/generate.py
+          python conformance/verify.py
+
+      - name: Smoke test relay CLI
+        run: python -m eacp.relay --help
