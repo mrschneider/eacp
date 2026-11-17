@@ -30,13 +30,15 @@ on:
 permissions:
   contents: read
 
-# A cancelled or failed macOS cell must not fail this workflow.
-continue-on-error: true
-
 jobs:
   test:
     name: Test py${{ matrix.python-version }} on macos-latest
     runs-on: macos-latest
+    # A real macOS test failure must not fail this workflow. (A cell that
+    # never gets an arm64 runner is CANCELLED by the acquisition policy —
+    # a cancelled job is not a failed one, so no continue-on-error can
+    # absorb it; that is why this platform lives in its own workflow.)
+    continue-on-error: true
     # The queue wait counts against the timeout; give the scarce arm64
     # runner room to show up.
     timeout-minutes: 60
