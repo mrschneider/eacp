@@ -269,7 +269,9 @@ class RSessionBase:
             if self.signed_manifest is not None:
                 data["_caller_manifest"] = self.signed_manifest.to_dict()
 
-        frame = EacpFrame(
+        # PERF: _construct bypasses the hooked __setattr__ per field
+        # (dataclass __init__ pays ~14 hooked calls for no reason here).
+        frame = EacpFrame._construct(
             msg_type=MsgType.MSG_SEND,
             opcode=opcode,
             sender_pin=self.identity.pin,

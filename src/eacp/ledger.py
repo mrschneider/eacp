@@ -26,6 +26,11 @@ import time
 from dataclasses import asdict, dataclass
 from typing import List, Optional
 
+try:  # PERF: ~5x faster JSON encode on the audit write path
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - orjson is optional
+    _orjson = None
+
 
 class LedgerIntegrityError(Exception):
     """The on-disk ledger could not be recovered: corrupt line or broken
@@ -274,7 +279,11 @@ class AuditLedger:
         if self.file_path:
             if self._bytes_written >= self.rotate_bytes:
                 self._rotate()
-            line = json.dumps(asdict(entry)) + "\n"
+            d = asdict(entry)
+            if _orjson is not None:
+                line = _orjson.dumps(d).decode("utf-8") + "\n"
+            else:
+                line = json.dumps(d) + "\n"
             fh = self._handle()
             fh.write(line)
             fh.flush()

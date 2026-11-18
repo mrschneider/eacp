@@ -102,18 +102,24 @@ class AgentIdentity:
         Signs an EACP frame:
         Sets FLAG_SIGNED, attaches session_handle and 64-byte Ed25519 signature to Slot 3.
         """
-        frame.sender_pin = self.pin
-        frame.flags |= FrameFlags.FLAG_SIGNED
-        frame.envelope = CryptoEnvelope(session_handle=session_handle, signature=b"")
+        frame._set_many(
+            sender_pin=self.pin,
+            flags=frame.flags | FrameFlags.FLAG_SIGNED,
+            envelope=CryptoEnvelope(session_handle=session_handle, signature=b""),
+        )
         signed_data = frame.get_signed_bytes()
         sig = self.sign(signed_data)
         frame.envelope.signature = sig
 
     def pack_frame(self, frame: EacpFrame, session_handle: int = 0) -> bytes:
         """Atomically encode, sign and pack once; retain no mutable-data cache."""
-        frame.sender_pin = self.pin
-        frame.flags |= FrameFlags.FLAG_SIGNED
-        frame.envelope = CryptoEnvelope(session_handle=session_handle, signature=b"")
+        # PERF: one cache-invalidation check for all 3 field writes (was
+        # 3 hooked __setattr__ calls, each paying a dict lookup).
+        frame._set_many(
+            sender_pin=self.pin,
+            flags=frame.flags | FrameFlags.FLAG_SIGNED,
+            envelope=CryptoEnvelope(session_handle=session_handle, signature=b""),
+        )
         data = frame._encode_data()
         frame.envelope.signature = self.sign(frame.get_signed_bytes(data))
         return frame.pack(data)
@@ -132,9 +138,11 @@ class AgentIdentity:
         before pack() serialises the frame.
         """
         # Cheap prep inline (no crypto)
-        frame.sender_pin = self.pin
-        frame.flags |= FrameFlags.FLAG_SIGNED
-        frame.envelope = CryptoEnvelope(session_handle=session_handle, signature=b"")
+        frame._set_many(
+            sender_pin=self.pin,
+            flags=frame.flags | FrameFlags.FLAG_SIGNED,
+            envelope=CryptoEnvelope(session_handle=session_handle, signature=b""),
+        )
         data = frame._encode_data()
         signed_bytes = frame.get_signed_bytes(data)
         # Offload the curve op — for LARGE frames. Small frames sign inline:

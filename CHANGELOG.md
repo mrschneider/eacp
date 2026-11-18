@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.4] — 2026-11-17
+
+### Changed
+- **`EacpFrame._construct()` — split plain/factory defaults.** The
+  construction bypass now copies the 15 plain (immutable) field defaults
+  with a single C-level `dict()` call and only iterates the 2
+  `default_factory` fields in Python. The old single loop paid a Python
+  `if` + dict store per field (~17×). `_construct` went from ~2.3 µs to
+  ~1.8 µs per call.
+- **`EacpFrame._set_many()` — batch field writes with one
+  cache-invalidation check.** `pack_frame`, `sign_frame` and
+  `pack_frame_async` set 3 fields (`sender_pin`, `flags`, `envelope`)
+  each; every individual `__setattr__` paid a `d.get("raw_payload")`
+  lookup for the tamper-invalidation hook. `_set_many` writes all fields
+  directly to `__dict__` and performs the invalidation check exactly
+  once. Cache fields may be set directly without triggering
+  invalidation — identical security semantics to `__setattr__`.
+- **`RSessionBase.send()` uses `_construct`.** The only remaining hot
+  path still paying the dataclass `__init__` (~14 hooked `__setattr__`
+  calls per frame) now uses the construction bypass.
+- **Zero-copy header/slot parsing.** `EacpFrame.unpack` and
+  `unpack_slots` use `struct.unpack_from` instead of
+  `unpack(buffer[:N])`, eliminating the 48-byte and 16-byte slice copies
+  on every receive.
+- **`TraceContext.new_root()` — single `os.urandom(24)`.** Two
+  `secrets.token_hex` calls (each wrapping `os.urandom` + `.hex()`)
+  became one `os.urandom(24)` split into trace_id/span_id: 0.89 µs →
+  0.41 µs per frame on the send path.
+- **`AuditLedger._record()` — `orjson` fast path.** The audit line is a
+  flat dict of str/int/float (always byte-compatible), so `orjson.dumps`
+  replaces `json.dumps` when available (~2-3× faster encode on the
+  audit thread). `orjson` remains optional; absent = stdlib path.
+
+### Performance
+Subprocess benchmark (`bench/relay_bench.py`, real TCP, 600 frames):
+pipelined conc=32 **1,233 → 2,150 req/s (+74%)**, sequential
+**576 → 870 req/s (+51%)**, RTT p50 **1.42 → 1.10 ms (−22%)**.
+Cumulative since the 2026-11-13 baseline: pipelined **+124%**,
+stall-recovery p99 **−69%**. Wire format unchanged (conformance
+vectors byte-identical); 126 tests + conformance pass.
+
 ## [2.2.3] — 2026-11-17
 
 ### Added

@@ -208,25 +208,58 @@ class EacpFrame:
     # FACTORIES (fresh instance per frame) — a shared mutable default would
     # alias state across frames. (Unannotated on purpose: an annotated name
     # would become a dataclass FIELD.)
-    _FIELD_DEFAULTS = None
+    #
+    # Defaults are split into a PLAIN dict (copied with a single C-level
+    # dict() call) and a small FACTORY tuple (fresh instance per frame).
+    # The old single loop paid a Python `if` + dict store per field (~17x);
+    # the copy is O(n) in C and only the 2 factory fields need a Python call.
+    _FIELD_PLAIN_DEFAULTS: Optional[dict] = None
+    _FIELD_FACTORY_DEFAULTS: Optional[Tuple[Tuple[str, Any], ...]] = None
 
     @classmethod
     def _construct(cls, **kwargs: Any) -> "EacpFrame":
-        if cls._FIELD_DEFAULTS is None:
-            entries = []
+        if cls._FIELD_PLAIN_DEFAULTS is None:
+            plain: dict = {}
+            factories: list = []
             for _f in _dc_fields(cls):
                 if _f.default is not _dc_missing:
-                    entries.append((_f.name, None, _f.default))
+                    plain[_f.name] = _f.default
                 elif _f.default_factory is not _dc_missing:
-                    entries.append((_f.name, _f.default_factory, None))
-            cls._FIELD_DEFAULTS = tuple(entries)
-        d = {}
-        for name, factory, value in cls._FIELD_DEFAULTS:
-            d[name] = factory() if factory is not None else value
+                    factories.append((_f.name, _f.default_factory))
+            cls._FIELD_PLAIN_DEFAULTS = plain
+            cls._FIELD_FACTORY_DEFAULTS = tuple(factories)
+        d = dict(cls._FIELD_PLAIN_DEFAULTS)  # C-level copy of plain defaults
+        for name, factory in cls._FIELD_FACTORY_DEFAULTS:
+            d[name] = factory()  # fresh instance per frame (no aliasing)
         d.update(kwargs)
         obj = object.__new__(cls)
         object.__setattr__(obj, "__dict__", d)
         return obj
+
+    def _set_many(self, **fields: object) -> None:
+        """Set multiple fields with a SINGLE cache-invalidation check.
+
+        The per-field ``__setattr__`` hook pays one ``d.get("raw_payload")``
+        lookup per call.  When ``pack_frame`` sets 3 fields (sender_pin,
+        flags, envelope) that is 3 lookups for the same answer.  This
+        method writes all fields directly to ``__dict__`` and performs the
+        invalidation check exactly once — the security semantics are
+        identical to ``__setattr__``: cache fields (raw_payload/_wire/
+        _signed_cache) may be set directly without triggering
+        invalidation; any OTHER field clears the caches.
+        """
+        d = self.__dict__
+        non_cache = False
+        for name, value in fields.items():
+            d[name] = value
+            if name not in ("raw_payload", "_wire", "_signed_cache"):
+                non_cache = True
+        if non_cache and d.get("raw_payload") is not None:
+            d["raw_payload"] = None
+            if d.get("_wire") is not None:
+                d["_wire"] = None
+            if d.get("_signed_cache") is not None:
+                d["_signed_cache"] = None
 
     def is_pulse(self) -> bool:
         return self.msg_type == MsgType.MSG_PULSE
@@ -295,7 +328,8 @@ class EacpFrame:
         if len(payload) < 16:
             raise ValueError(f"Slot length block too short: {len(payload)} < 16")
 
-        l0, l1, l2, l3 = struct.unpack(">IIII", payload[:16])
+        # PERF: unpack_from avoids the 16-byte slice copy.
+        l0, l1, l2, l3 = struct.unpack_from(">IIII", payload, 0)
         offset = 16
 
         # Strict bounds check: declared slot lengths must fit the payload exactly.
@@ -483,7 +517,9 @@ class EacpFrame:
         if len(buffer) < HEADER_SIZE:
             raise ValueError(f"Buffer too short for EACP header: {len(buffer)} < {HEADER_SIZE}")
         
-        magic, ver, msg_type_raw, opcode, flags_raw, sender_pin, target_pin, tx_id, cap_mask, status_raw, payload_len = HEADER_STRUCT.unpack(buffer[:HEADER_SIZE])
+        # PERF: unpack_from avoids the 48-byte slice copy that
+        # HEADER_STRUCT.unpack(buffer[:HEADER_SIZE]) would make.
+        magic, ver, msg_type_raw, opcode, flags_raw, sender_pin, target_pin, tx_id, cap_mask, status_raw, payload_len = HEADER_STRUCT.unpack_from(buffer, 0)
         
         if magic != EACP_MAGIC:
             raise ValueError(f"Invalid EACP magic: {magic!r} != {EACP_MAGIC!r}")
