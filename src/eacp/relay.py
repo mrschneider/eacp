@@ -724,10 +724,17 @@ class EacpRelay:
         sender_pin = frame.sender_pin
         target_pin = frame.target_pin
         span_start = time.perf_counter()
+        # PERF: the trace id is consumed ONLY by the debug span log below.
+        # Reading frame.data here would trigger the lazy JSON parse on the
+        # relay's hot path (defeating the deferred-parse win), so it is
+        # gated on the debug level: at the default INFO level the relay
+        # forwards frames with ZERO data parse.
         trace_id = None
-        if isinstance(frame.data, dict) and isinstance(frame.data.get("_trace"), str):
-            tc = TraceContext.parse(frame.data["_trace"])
-            trace_id = tc.trace_id if tc else None
+        if logger.isEnabledFor(logging.DEBUG):
+            data = frame.data
+            if isinstance(data, dict) and isinstance(data.get("_trace"), str):
+                tc = TraceContext.parse(data["_trace"])
+                trace_id = tc.trace_id if tc else None
 
         # Audit ledger record & metrics tracking
         await self.ledger.record_async(

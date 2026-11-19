@@ -102,6 +102,36 @@ def _orjson_byte_identical(obj: Any) -> bool:
     return True
 
 
+def _parse_data_slot(slot1_bytes: bytes) -> Any:
+    """Parses slot 1 (the JSON data slot) with the wire contract intact.
+
+    The stdlib ``json`` module is the wire contract (it tolerates NaN /
+    Infinity literals), so an orjson strict-decode failure falls back to it
+    before treating the slot as raw bytes (legacy contract). Shared by the
+    eager path (``unpack_slots``) and the lazy path (``__getattribute__``)
+    so both can never drift.
+    """
+    if not slot1_bytes:
+        return None
+    if _orjson is not None:
+        try:
+            # PERF: ~5x faster parse. STRICT mode — the stdlib json module
+            # is the wire contract, so a strict decode failure falls back to
+            # it before treating the slot as raw bytes.
+            return _orjson.loads(slot1_bytes)
+        except _orjson.JSONDecodeError:
+            try:
+                return json.loads(slot1_bytes.decode("utf-8"))
+            except Exception:
+                return slot1_bytes  # non-JSON slot: raw bytes (legacy contract)
+        except Exception:
+            return slot1_bytes
+    try:
+        return json.loads(slot1_bytes.decode("utf-8"))
+    except Exception:
+        return slot1_bytes
+
+
 @dataclass
 class ExecutionConstraints:
     token_budget: int = 0
@@ -152,14 +182,37 @@ class EacpFrame:
     
     # Payload slots (TIpcArgs)
     verb: str = ""
+    # PERF: lazy data slot.  unpack() stores the raw slot-1 bytes in
+    # _data_raw and defers the JSON parse to the first .data access
+    # (see __getattr__).  The relay's routing path (verify → ledger →
+    # forward) never reads .data — it uses raw_payload for the audit
+    # digest and the wire bytes for forwarding — so the JSON parse is
+    # skipped on the dominant per-frame cost.  The client's handler path
+    # pays the parse once on first access, identical to the old eager
+    # behaviour.  _data_raw is a CACHE (like _wire/_signed_cache): it is
+    # cleared on any field mutation so a tampered frame re-derives.
     data: Any = None
     constraints: ExecutionConstraints = field(default_factory=ExecutionConstraints)
     envelope: CryptoEnvelope = field(default_factory=CryptoEnvelope)
     raw_payload: Optional[bytes] = None
+    # PERF: raw slot-1 (data) bytes, kept so the JSON parse can be DEFERRED
+    # to the first .data access (see __getattribute__). unpack() stores the
+    # slot here and parks `data` at _DATA_UNPARSED; the relay routing path
+    # (verify -> ledger -> forward) never reads .data, so it skips the parse
+    # entirely — the dominant per-frame cost for large payloads. The client
+    # handler path pays the parse once on first access, identical to the old
+    # eager behaviour. _data_raw is a CACHE: it is cleared on any field
+    # mutation (with the other caches) so a tampered frame re-derives.
+    _data_raw: Optional[bytes] = None
+    # Sentinel parked in `data` by unpack() until the first read triggers the
+    # lazy parse. A plain (UNANNOTATED) class attribute so it is NOT a
+    # dataclass field — it must not pollute __dict__/asdict()/copy. Never a
+    # legitimate data value; identity-compared with `is`.
+    _DATA_UNPARSED = object()
     # Exact wire bytes the frame was parsed FROM (header + payload). Cached
     # at unpack() so a relay can forward it verbatim with zero re-encode.
     # Cleared on any post-construction field mutation (see __setattr__) so a
-    # tampered frame falls back to re-encoding and the change is visible.
+    # tampered frame falls back to re-encode and the change is visible.
     _wire: Optional[bytes] = None
     # Signing-contract v2 bytes, computed lazily on the first
     # get_signed_bytes() call and reused by repeated verifications of the
@@ -178,24 +231,55 @@ class EacpFrame:
 
     def __setattr__(self, name: str, value: object) -> None:
         """Post-construction mutation of any field invalidates the parsed
-        wire caches (raw_payload, _wire and the signed-bytes caches):
-        verification must still SEE tampering (test_frame_signing_and_
-        verification re-encodes mutated fields), while the unmodified relay
-        verify/forward path keeps the zero-re-encode fast paths in
+        wire caches (raw_payload, _data_raw, _wire and the signed-bytes
+        caches): verification must still SEE tampering (test_frame_signing_
+        and_verification re-encodes mutated fields), while the unmodified
+        relay verify/forward path keeps the zero-re-encode fast paths in
         get_signed_bytes / pack.
 
-        PERF: during dataclass __init__ all three caches are None, so the
-        first d.get("raw_payload") check short-circuits and we skip the
-        other two lookups entirely (saves 2 dict lookups × ~175K calls)."""
-        if name not in ("raw_payload", "_wire", "_signed_cache"):
+        PERF: during dataclass __init__ all caches are None, so the first
+        d.get("raw_payload") check short-circuits and we skip the other
+        lookups entirely (saves dict lookups × ~175K calls)."""
+        if name not in ("raw_payload", "_data_raw", "_wire", "_signed_cache"):
             d = self.__dict__
             if d.get("raw_payload") is not None:
                 object.__setattr__(self, "raw_payload", None)
+                if d.get("_data_raw") is not None:
+                    object.__setattr__(self, "_data_raw", None)
                 if d.get("_wire") is not None:
                     object.__setattr__(self, "_wire", None)
                 if d.get("_signed_cache") is not None:
                     object.__setattr__(self, "_signed_cache", None)
         object.__setattr__(self, name, value)
+
+    def __getattribute__(self, name: str) -> Any:
+        """Lazy data-slot parse (the mechanism the `data` field comment
+        documents).
+
+        unpack() parks `data` at the `_DATA_UNPARSED` sentinel and stashes
+        the raw slot-1 bytes in `_data_raw`. The FIRST `.data` read parses
+        them (orjson fast path, stdlib fallback, raw-bytes last — exactly
+        the unpack_slots contract) and caches the result. The relay routing
+        path never touches `.data`, so it pays NO JSON parse; the client
+        handler path pays it once, identical to the old eager behaviour.
+
+        PERF cost of the hook: every attribute read on an EacpFrame now pays
+        one `name == "data"` string compare (~80ns) — negligible next to the
+        ~10-200us JSON parse it skips on the relay path, and the parse is
+        still done exactly once per frame. All other attributes (the common
+        case: sender_pin, flags, envelope, ...) take the direct path."""
+        if name == "data":
+            val = object.__getattribute__(self, "data")
+            if val is EacpFrame._DATA_UNPARSED:
+                raw = object.__getattribute__(self, "_data_raw")
+                if raw is None:
+                    parsed = None
+                else:
+                    parsed = _parse_data_slot(raw)
+                object.__setattr__(self, "data", parsed)
+                return parsed
+            return val
+        return object.__getattribute__(self, name)
 
     # PERF: construction bypass. dataclass __init__ runs one
     # object.__setattr__ per field — and this class's __setattr__ is a
@@ -252,10 +336,12 @@ class EacpFrame:
         non_cache = False
         for name, value in fields.items():
             d[name] = value
-            if name not in ("raw_payload", "_wire", "_signed_cache"):
+            if name not in ("raw_payload", "_data_raw", "_wire", "_signed_cache"):
                 non_cache = True
         if non_cache and d.get("raw_payload") is not None:
             d["raw_payload"] = None
+            if d.get("_data_raw") is not None:
+                d["_data_raw"] = None
             if d.get("_wire") is not None:
                 d["_wire"] = None
             if d.get("_signed_cache") is not None:
@@ -350,27 +436,11 @@ class EacpFrame:
 
         slot1_bytes = payload[offset : offset + l1]
         offset += l1
-        data = None
-        if slot1_bytes:
-            if _orjson is not None:
-                try:
-                    # PERF: ~5x faster parse. STRICT mode — the stdlib json
-                    # module is the wire contract (it tolerates NaN/Infinity
-                    # literals), so a strict decode failure falls back to it
-                    # before treating the slot as raw bytes.
-                    data = _orjson.loads(slot1_bytes)
-                except _orjson.JSONDecodeError:
-                    try:
-                        data = json.loads(slot1_bytes.decode("utf-8"))
-                    except Exception:
-                        data = slot1_bytes  # non-JSON slot: raw bytes (legacy contract)
-                except Exception:
-                    data = slot1_bytes
-            else:
-                try:
-                    data = json.loads(slot1_bytes.decode("utf-8"))
-                except Exception:
-                    data = slot1_bytes
+        # PERF: return the RAW slot-1 bytes; the JSON parse is deferred to
+        # the first `.data` access (see EacpFrame.__getattribute__). The
+        # relay routing path never reads .data, so it skips the parse.
+        # unpack() stashes these in _data_raw.
+        data = slot1_bytes
 
         slot2_bytes = payload[offset : offset + l2]
         offset += l2
@@ -592,6 +662,9 @@ class EacpFrame:
                 raise ValueError("Trailing bytes after the compressed stream (concatenated streams are rejected)")
 
         verb, data, constraints, envelope = cls.unpack_slots(effective_payload)
+        # data is the RAW slot-1 bytes (unpack_slots defers the parse). Park
+        # it in _data_raw and set `data` to the lazy sentinel: the JSON parse
+        # runs on first .data access, which the relay routing path never does.
         return cls._construct(
             magic=magic,
             version=ver,
@@ -604,7 +677,8 @@ class EacpFrame:
             capabilities_mask=cap_mask,
             status=status,
             verb=verb,
-            data=data,
+            data=cls._DATA_UNPARSED,
+            _data_raw=data,
             constraints=constraints,
             envelope=envelope,
             raw_payload=effective_payload,

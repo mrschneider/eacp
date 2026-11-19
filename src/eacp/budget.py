@@ -68,6 +68,16 @@ class PayloadTokenMeter:
 
     @staticmethod
     def request_size(frame: EacpFrame) -> int:
+        # PERF: a parsed frame already carries the exact slot-1 (data) wire
+        # bytes in _data_raw — that IS the JSON encoding, so its length is
+        # the request size with zero re-encode. Re-encoding frame.data to
+        # JSON (the old path) paid a full json.dumps of the payload on every
+        # dispatch, and with the lazy data slot it would also force the
+        # parse. Freshly-constructed frames (no _data_raw) fall back to
+        # encoding the in-memory object, which is the source of truth there.
+        raw = frame._data_raw
+        if raw is not None:
+            return len(raw)
         try:
             return len(json.dumps(frame.data or {}).encode("utf-8"))
         except (TypeError, ValueError):

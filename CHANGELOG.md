@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.5] — 2026-11-19
+
+### Changed
+- **`EacpFrame.unpack()` — lazy data-slot parse (the mechanism the `data`
+  field comment documented, now implemented).** `unpack_slots` returns the
+  RAW slot-1 bytes and `unpack()` parks them in `_data_raw` with `data` set
+  to the `_DATA_UNPARSED` sentinel (a plain, unannotated class attribute —
+  not a dataclass field, so it never pollutes `__dict__`/`asdict()`/copy).
+  The JSON parse (orjson fast path → stdlib fallback → raw bytes, the exact
+  `unpack_slots` contract) now runs on the **first `.data` access** via a
+  `__getattribute__` hook. The relay routing path (verify → ledger →
+  forward) never reads `.data` — it digests `raw_payload` and forwards the
+  wire bytes — so it now performs **zero JSON parse per frame**. The client
+  handler path pays the parse exactly once, identical to the old eager
+  behaviour. `_data_raw` is a cache like `_wire`: `__setattr__`/
+  `_set_many` clear it on any field mutation, so a tampered frame
+  re-derives (same security semantics).
+- **`PayloadTokenMeter.request_size()` — wire bytes, no re-encode.** A
+  parsed frame already carries the exact slot-1 JSON bytes in `_data_raw`;
+  `request_size` now returns `len(_data_raw)` instead of paying a full
+  `json.dumps` of the payload on every dispatch (and forcing the lazy
+  parse). Freshly-constructed frames (no `_data_raw`) fall back to the old
+  encode, which is the source of truth there.
+- **`EacpRelay.route_frame()` — trace-id extraction gated on the debug
+  level.** The `trace_id` is consumed only by the debug span log; reading
+  `frame.data` for it re-triggered the lazy parse on the relay's hot path
+  and would have defeated the deferred-parse win. At the default INFO level
+  the relay now forwards frames with no data parse at all; at DEBUG the
+  behaviour is unchanged.
+
+### Performance
+Subprocess benchmark (`bench/relay_bench.py`, real TCP, 300 frames,
+3-run average): pipelined conc=32 **1818 → ~2060 req/s (+13–15%)**, RTT
+p50 **1.32 → ~1.26 ms (−4%)**; per-frame relay cost on large payloads
+**64 KB 207 → 154 µs (−26%)**, **16 KB 73 → 56 µs (−23%)**. The remaining
+RTT floor is the Ed25519 sign+verify pair (~0.176 ms/RTT) — the security
+model; an offload to a thread pool was measured and rejected (1348 → 1108
+req/s). Wire format unchanged (conformance vectors byte-identical);
+126 tests + conformance pass.
+
 ## [2.2.4] — 2026-11-17
 
 ### Changed
