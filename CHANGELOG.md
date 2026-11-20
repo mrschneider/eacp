@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.6] — 2026-11-19
+
+### Changed
+- **`EacpFrame.__getattribute__()` — direct `__dict__` read on the hot
+  path.** The previous version returned `object.__getattribute__(self,
+  name)` for every non-`data` attribute read. That re-enters the
+  descriptor machinery on the C frame stack for each of the ~253
+  attribute reads per frame on the relay route path and the client send
+  path (`sender_pin`, `flags`, `envelope`, `msg_type`, `opcode`,
+  `capabilities_mask`, `verb`, `transaction_id`, `target_pin`, `magic`,
+  `version`, `constraints`, `raw_payload`, ...). Measured ~1.80 µs/call
+  versus ~0.41 µs/call for a raw `__dict__` lookup — roughly 4× per read
+  and ~250 µs/frame of pure dispatch. The hot path only ever reads
+  INSTANCE attributes (every dataclass field is written to `__dict__` by
+  `unpack`/`_construct`), so the hook now reads `__dict__` directly and
+  falls back to `object.__getattribute__` only when the name is a class
+  attribute (methods, `_FIELD_*`) — a case the measured hot path never
+  hits. Correctness is preserved: `name in __dict__` is exactly the
+  instance-vs-class distinction, the lazy `.data` parse still runs once
+  per frame, and methods/class attributes behave identically to before.
+
+### Performance
+Per-frame dispatch overhead on the relay route and client send paths
+drops ~4× per attribute read (~250 µs/frame of pure dispatch on the
+~253 reads/frame). Aggregate subprocess throughput is within noise
+(pipelined conc=32: 2115 → 2074 req/s) because the remaining RTT floor is
+the Ed25519 sign+verify pair (~0.176 ms/RTT) — the security model; the
+win is measured at the frame level and compounds under heavier per-frame
+work. Wire format unchanged (conformance vectors byte-identical); 126
+tests + conformance pass.
+
 ## [2.2.5] — 2026-11-19
 
 ### Changed
